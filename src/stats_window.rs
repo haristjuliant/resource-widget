@@ -150,12 +150,12 @@ pub unsafe fn open(app: &'static App, owner: HWND) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
-            hIcon: null_mut(),
+            hIcon: crate::app_icon(hinstance, false),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: null_mut(),
             lpszMenuName: null(),
             lpszClassName: class.as_ptr(),
-            hIconSm: null_mut(),
+            hIconSm: crate::app_icon(hinstance, true),
         };
         RegisterClassExW(&wc); // gagal bila sudah terdaftar; tidak masalah
 

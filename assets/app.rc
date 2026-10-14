@@ -1,0 +1,28 @@
+// Resource Windows: ikon aplikasi dan info versi (tampil di properti file dan Task Manager).
+// Nilai numerik dipakai langsung agar tidak butuh header SDK.
+
+1 ICON "icon.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+{
+    BLOCK "StringFileInfo"
+    {
+        BLOCK "040904B0"
+        {
+            VALUE "FileDescription", "Resource Widget"
+            VALUE "ProductName", "Resource Widget"
+            VALUE "InternalName", "resource-widget"
+            VALUE "OriginalFilename", "resource-widget.exe"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "ProductVersion", "0.1.0"
+        }
+    }
+    BLOCK "VarFileInfo"
+    {
+        VALUE "Translation", 0x0409, 1200
+    }
+}

@@ -129,6 +129,20 @@ fn scan_every_ticks(interval_ms: u32) -> u32 {
     PROC_SCAN_EVERY_MS.div_ceil(interval_ms.max(1)).max(1)
 }
 
+/// Ikon aplikasi dari resource exe (ID 1); `small` = ukuran ikon kecil sistem (judul jendela).
+/// `1 as *const u16` adalah `MAKEINTRESOURCE(1)`, bukan pointer sungguhan.
+#[allow(clippy::manual_dangling_ptr)]
+unsafe fn app_icon(hinstance: HINSTANCE, small: bool) -> HICON {
+    unsafe {
+        let (cx, cy) = if small {
+            (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON))
+        } else {
+            (GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON))
+        };
+        LoadImageW(hinstance, 1usize as *const u16, IMAGE_ICON, cx, cy, LR_SHARED) as HICON
+    }
+}
+
 /// Mode tampilan menurut pengaturan (ringkas mematikan grafik dan proses).
 fn view_of(s: &Settings) -> View {
     View::from_flags(s.compact, s.procs)
@@ -664,12 +678,12 @@ fn main() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
-            hIcon: null_mut(),
+            hIcon: app_icon(hinstance, false),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: null_mut(),
             lpszMenuName: null(),
             lpszClassName: class.as_ptr(),
-            hIconSm: null_mut(),
+            hIconSm: app_icon(hinstance, true),
         };
         if RegisterClassExW(&wc) == 0 {
             return;

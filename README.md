@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" alt="Ikon Resource Widget" width="96">
+</p>
+
 # Resource Widget
 
 Widget Windows mini (ala NetWorx) yang selalu di atas dan menampilkan **kecepatan jaringan ↓/↑, CPU, RAM, dan disk, masing-masing dengan grafik riwayat dan proses teratasnya**, plus pemakaian data hari ini dan jendela statistik harian/bulanan. Tersedia mode ringkas (hanya ikon, bar, dan angka) dan lebar kartu selalu mengikuti kolom yang tampil. Ditulis dengan Rust + `windows-sys` (GDI murni, tanpa framework UI) agar sangat ringan.
@@ -16,9 +20,20 @@ Widget Windows mini (ala NetWorx) yang selalu di atas dan menampilkan **kecepata
 
 *Gambar kartu dibuat dari data demo sintetis (semua proses bernama `demo`), dan angka pada jendela statistik adalah data contoh; tidak ada data dari mesin penulis.*
 
-## Binary siap pakai
+## Cara menjalankan
 
-`dist/resource-widget.exe` (Windows 10/11 x64, tanpa instalasi). Cukup jalankan; tidak butuh Rust.
+Tanpa instalasi dan tanpa Rust:
+
+1. Unduh `dist/resource-widget.exe` (dari halaman repo: buka file, lalu **Download raw file**; atau `git clone` lalu ambil dari folder `dist/`). Windows 10/11 x64.
+2. Simpan di folder tetap (mis. `C:\Tools\ResourceWidget\`), lalu **klik ganda** `resource-widget.exe`. Kartu langsung muncul di pojok kanan atas layar.
+3. Windows SmartScreen mungkin menampilkan "Windows protected your PC" karena exe ini tidak ditandatangani. Klik **More info → Run anyway**.
+
+Cara memakainya:
+
+- **Pindahkan** kartu dengan drag; **klik kanan** untuk semua pengaturan; **klik ganda** untuk statistik pemakaian.
+- **Keluar:** klik kanan → **Keluar** (kartu tidak punya tombol di taskbar).
+- **Otomatis jalan saat Windows mulai:** klik kanan → **Jalankan saat Windows mulai**. Jika exe dipindah folder, matikan lalu nyalakan lagi opsi itu.
+- Kartu tidak terlihat? Mungkin ada di balik jendela layar penuh, atau di virtual desktop lain. Jalankan lagi `resource-widget.exe` tidak membuat dua kartu; hanya satu instance yang berjalan.
 
 ## Build dan jalankan
 
@@ -27,7 +42,7 @@ cargo build --release          # hasil: target\release\resource-widget.exe
 target\release\resource-widget.exe
 ```
 
-Butuh Rust (target `x86_64-pc-windows-msvc`) dan VS Build Tools. Exe tidak butuh VC++ Redistributable (CRT di-link statis); satu-satunya dependensi crate adalah `windows-sys`.
+Butuh Rust (target `x86_64-pc-windows-msvc`) dan VS Build Tools dengan Windows SDK (untuk `rc.exe`, yang menyematkan ikon dan info versi). Exe tidak butuh VC++ Redistributable (CRT di-link statis); satu-satunya dependensi **runtime** adalah `windows-sys`. `embed-resource` hanya dipakai saat build, dan `png` hanya untuk pembuat ikon (`examples/make_icon.rs`); keduanya tidak ikut ke exe.
 
 Perintah lain:
 
@@ -36,6 +51,7 @@ cargo test                     # tes logika (delta counter, format, pengaturan, 
 cargo run --example probe -- 10          # cetak metrik dan proses teratas selama 10 dtk (tanpa GUI)
 cargo run --example probe -- 10 "Wi-Fi"  # sama, tapi hanya satu adapter
 cargo run --release --example screenshot -- demo.bmp 200 [full|noprocs|compact]   # gambar kartu dengan data demo (untuk README)
+cargo run --release --example make_icon  # menggambar ulang ikon: assets\icon.ico dan docs\icon.png
 ```
 
 ## Membaca kartu
@@ -91,7 +107,7 @@ Jika exe dipindah setelah "Jalankan saat Windows mulai" dinyalakan, matikan lalu
 
 | | |
 |---|---|
-| Ukuran exe | ≈ 313 KB |
+| Ukuran exe | ≈ 330 KB (termasuk ikon 7 ukuran dan info versi) |
 | Memori (private working set, angka "Memori" di Task Manager) | ≈ 1 MB; naik sampai ≈ 2 MB hanya selama beberapa milidetik saat pemindaian proses |
 | CPU, proses teratas **mati** | ≈ 0,3–8 ms CPU per detik (bervariasi menurut core yang dipakai Windows dan beban sistem) |
 | CPU, proses teratas **nyala** | tambahan ≈ 3 ms CPU per detik pada selang 1 detik (≈ 0,02 % dari seluruh CPU) |
