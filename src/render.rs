@@ -1,27 +1,32 @@
-//! Render GDI murni: tata letak (satuan 96-DPI yang di-skala), grafik, bar, dan teks.
+//! Render GDI murni: tata letak (satuan 96-DPI yang di-skala), grafik, bar, ikon, dan teks.
+//!
+//! Lebar kartu mengikuti mode (`View`): penuh (grafik + proses teratas), tanpa proses,
+//! atau ringkas (hanya ikon, bar, dan angka). Tidak ada ruang kosong di sisi kanan.
 
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT};
+use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::*;
 
 use crate::metrics::Sample;
+use crate::procs::{ProcTop, Top};
 use crate::usage::fmt_bytes;
 use crate::wide;
 
 pub const HISTORY_LEN: usize = 60;
-/// Batas bawah skala grafik (byte/dtk) agar noise kecil tidak memenuhi grafik.
+/// Batas bawah skala grafik jaringan (byte/dtk) agar noise kecil tidak memenuhi grafik.
 const GRAPH_FLOOR: u64 = 128 * 1024;
 /// Persentase mulai dari mana bar berwarna merah.
 const HOT_PERCENT: f32 = 90.0;
 
 // ------------------------------------------------------------ logika murni
 
-/// Ring buffer riwayat (1 sampel per detik): kecepatan jaringan (byte/dtk),
-/// serta beban CPU dan RAM (persen 0..=100).
+/// Ring buffer riwayat (1 sampel per detik): kecepatan jaringan (byte/dtk), serta beban
+/// CPU, RAM, dan waktu aktif disk (persen 0..=100).
 pub struct History {
     down: [u64; HISTORY_LEN],
     up: [u64; HISTORY_LEN],
+    disk: [u8; HISTORY_LEN],
     cpu: [u8; HISTORY_LEN],
     mem: [u8; HISTORY_LEN],
     head: usize,
@@ -29,14 +34,22 @@ pub struct History {
 
 impl History {
     pub fn new() -> Self {
-        History { down: [0; HISTORY_LEN], up: [0; HISTORY_LEN], cpu: [0; HISTORY_LEN], mem: [0; HISTORY_LEN], head: 0 }
+        History {
+            down: [0; HISTORY_LEN],
+            up: [0; HISTORY_LEN],
+            disk: [0; HISTORY_LEN],
+            cpu: [0; HISTORY_LEN],
+            mem: [0; HISTORY_LEN],
+            head: 0,
+        }
     }
 
-    pub fn push(&mut self, down: u64, up: u64, cpu_pct: f32, mem_pct: f32) {
-        self.down[self.head] = down;
-        self.up[self.head] = up;
-        self.cpu[self.head] = cpu_pct.clamp(0.0, 100.0).round() as u8;
-        self.mem[self.head] = mem_pct.clamp(0.0, 100.0).round() as u8;
+    pub fn push(&mut self, s: &Sample) {
+        self.down[self.head] = s.down;
+        self.up[self.head] = s.up;
+        self.disk[self.head] = s.disk_busy.clamp(0.0, 100.0).round() as u8;
+        self.cpu[self.head] = s.cpu.clamp(0.0, 100.0).round() as u8;
+        self.mem[self.head] = s.mem_percent().clamp(0.0, 100.0).round() as u8;
         self.head = (self.head + 1) % HISTORY_LEN;
     }
 
@@ -49,6 +62,10 @@ impl History {
         (0..HISTORY_LEN).map(move |i| self.up[(self.head + i) % HISTORY_LEN])
     }
 
+    pub fn disk(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..HISTORY_LEN).map(move |i| self.disk[(self.head + i) % HISTORY_LEN] as u64)
+    }
+
     pub fn cpu(&self) -> impl Iterator<Item = u64> + '_ {
         (0..HISTORY_LEN).map(move |i| self.cpu[(self.head + i) % HISTORY_LEN] as u64)
     }
@@ -57,6 +74,7 @@ impl History {
         (0..HISTORY_LEN).map(move |i| self.mem[(self.head + i) % HISTORY_LEN] as u64)
     }
 
+    /// Puncak kecepatan jaringan (unduh dan unggah).
     pub fn peak(&self) -> u64 {
         self.down.iter().chain(&self.up).copied().max().unwrap_or(0)
     }
@@ -93,8 +111,60 @@ pub fn fmt_rate(bytes_per_sec: u64, bits: bool) -> (String, &'static str) {
     (s, units[i])
 }
 
-fn gib(bytes: u64) -> f64 {
-    bytes as f64 / (1u64 << 30) as f64
+/// Byte → teks sangat pendek: "512M", "1.2G", "0B".
+pub fn fmt_compact(bytes: u64) -> String {
+    let units = ["B", "K", "M", "G", "T"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 999.5 && i < units.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{v:.0}B")
+    } else if v < 9.95 {
+        format!("{v:.1}{}", units[i])
+    } else {
+        format!("{v:.0}{}", units[i])
+    }
+}
+
+/// Persen×10 (0..=1000) → "12%", atau "<1%" bila di bawah 1 %.
+pub fn fmt_cpu_share(pct10: u64) -> String {
+    if pct10 < 10 { "<1%".into() } else { format!("{}%", (pct10 + 5) / 10) }
+}
+
+/// Teks nilai untuk satu pemenang proses menurut metriknya.
+fn top_value(kind: TopKind, t: &Top) -> String {
+    match kind {
+        TopKind::Cpu => fmt_cpu_share(t.value),
+        TopKind::Mem => fmt_compact(t.value),
+        TopKind::Disk => fmt_compact(t.value),
+        TopKind::Net => format!("{}/s", fmt_compact(t.value)),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TopKind {
+    Cpu,
+    Mem,
+    Disk,
+    Net,
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Cpu,
+    Ram,
+    Disk,
+}
+
+/// Isi satu baris bar (ikon, pengisian, warna, teks nilai).
+struct Meter<'a> {
+    icon: Icon,
+    frac: f32,
+    hot: bool,
+    value: &'a str,
 }
 
 // ------------------------------------------------------------------- warna
@@ -115,6 +185,7 @@ pub const DOWN: (u8, u8, u8) = (61, 220, 151);
 pub const UP: (u8, u8, u8) = (255, 180, 84);
 const CPU: (u8, u8, u8) = (90, 169, 255);
 const RAM: (u8, u8, u8) = (199, 146, 234);
+const DISK: (u8, u8, u8) = (64, 201, 214);
 const HOT: (u8, u8, u8) = (255, 107, 107);
 pub const TEXT: COLORREF = rgb(230, 232, 238);
 pub const DIM: COLORREF = rgb(138, 144, 160);
@@ -126,24 +197,68 @@ fn c(t: (u8, u8, u8)) -> COLORREF {
 
 // ---------------------------------------------------------------- tata letak
 
-/// Ukuran logis (96-DPI, skala 100 %) kartu.
-pub const BASE_W: i32 = 240;
-pub const BASE_H: i32 = 143;
+/// Mode tampilan: menentukan kolom yang ada dan karenanya lebar kartu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct View {
+    /// Grafik riwayat di samping bar. `false` = mode ringkas.
+    pub graphs: bool,
+    /// Kolom proses teratas di paling kanan. Hanya bermakna bila `graphs`.
+    pub procs: bool,
+}
+
+impl View {
+    pub const FULL: View = View { graphs: true, procs: true };
+
+    /// Mode dari pengaturan: ringkas mematikan grafik dan proses.
+    pub fn from_flags(compact: bool, procs: bool) -> View {
+        View { graphs: !compact, procs: procs && !compact }
+    }
+
+    /// Tepi kanan kolom terakhir yang tampil (x logis).
+    fn right_edge(self) -> i32 {
+        if self.procs {
+            X_PROC.1
+        } else if self.graphs {
+            X_GRAPH.1
+        } else {
+            X_VALUE.1
+        }
+    }
+}
+
+/// Tinggi logis (96-DPI, skala 100 %) kartu; sama di semua mode.
+pub const BASE_H: i32 = 150;
 const CORNER: i32 = 10;
 /// Sisi (logis) area pegangan perubahan ukuran di sudut kanan-bawah.
 const GRIP: i32 = 16;
 
+/// Ukuran logis (96-DPI, skala 100 %) kartu untuk mode `view`.
+pub fn base_size(view: View) -> (i32, i32) {
+    (view.right_edge() + X_PAD, BASE_H)
+}
+
+// Kolom (x logis). Grafik jaringan, CPU, RAM, dan disk berbagi satu kolom yang sama;
+// kolom paling kanan berisi proses teratas tiap metrik.
+const X_PAD: i32 = 8;
+const X_ICON: (i32, i32) = (8, 20);
+const X_BAR: (i32, i32) = (24, 64);
+const X_VALUE: (i32, i32) = (66, 112);
+const X_GRAPH: (i32, i32) = (116, 176);
+const X_PROC: (i32, i32) = (180, 240);
+
 struct Layout {
     w: i32,
     h: i32,
+    view: View,
     down_line: RECT,
     up_line: RECT,
-    graph: RECT,
+    net_graph: RECT,
     cpu_row: RECT,
     cpu_graph: RECT,
     ram_row: RECT,
     ram_graph: RECT,
-    detail: RECT,
+    disk_row: RECT,
+    disk_graph: RECT,
     usage_sep: RECT,
     usage_row: RECT,
     s: Scale,
@@ -167,33 +282,40 @@ fn effective_dpi(dpi: u32, pct: u32) -> u32 {
     (dpi * pct / 100).max(48)
 }
 
-/// Ukuran piksel kartu pada DPI dan skala tertentu (tanpa membuat objek GDI).
-pub fn size_for(dpi: u32, pct: u32) -> (i32, i32) {
+/// Ukuran piksel kartu pada DPI, skala, dan mode tertentu (tanpa membuat objek GDI).
+pub fn size_for(dpi: u32, pct: u32, view: View) -> (i32, i32) {
     let s = Scale(effective_dpi(dpi, pct));
-    (s.px(BASE_W), s.px(BASE_H))
+    let (w, h) = base_size(view);
+    (s.px(w), s.px(h))
 }
 
 impl Layout {
-    fn new(eff_dpi: u32) -> Self {
+    fn new(eff_dpi: u32, view: View) -> Self {
         let s = Scale(eff_dpi);
+        let right = view.right_edge();
+        let row = |y0: i32, y1: i32| s.rect(X_PAD, y0, right, y1);
+        let graph = |y0: i32, y1: i32| s.rect(X_GRAPH.0, y0, X_GRAPH.1, y1);
+        let (w, h) = base_size(view);
         Layout {
-            w: s.px(BASE_W),
-            h: s.px(BASE_H),
-            down_line: s.rect(10, 10, 122, 32),
-            up_line: s.rect(10, 32, 122, 54),
-            graph: s.rect(128, 10, 230, 54),
-            cpu_row: s.rect(10, 62, 230, 82),
-            cpu_graph: s.rect(154, 63, 230, 81),
-            ram_row: s.rect(10, 84, 230, 104),
-            ram_graph: s.rect(154, 85, 230, 103),
-            detail: s.rect(10, 104, 230, 116),
+            w: s.px(w),
+            h: s.px(h),
+            view,
+            down_line: s.rect(X_PAD, 8, X_VALUE.1, 30),
+            up_line: s.rect(X_PAD, 30, X_VALUE.1, 52),
+            net_graph: graph(8, 52),
+            cpu_row: row(58, 78),
+            cpu_graph: graph(59, 77),
+            ram_row: row(80, 100),
+            ram_graph: graph(81, 99),
+            disk_row: row(102, 122),
+            disk_graph: graph(103, 121),
             usage_sep: RECT {
-                left: s.px(10),
-                top: s.px(119),
-                right: s.px(230),
-                bottom: s.px(119) + s.px(1).max(1),
+                left: s.px(X_PAD),
+                top: s.px(126),
+                right: s.px(right),
+                bottom: s.px(126) + s.px(1).max(1),
             },
-            usage_row: s.rect(10, 123, 230, 139),
+            usage_row: s.rect(X_PAD, 130, right, 146),
             s,
         }
     }
@@ -222,22 +344,26 @@ pub struct Renderer {
     br_up: HBRUSH,
     br_cpu: HBRUSH,
     br_ram: HBRUSH,
+    br_disk: HBRUSH,
+    br_disk_top: HBRUSH,
     br_hot: HBRUSH,
     br_cpu_fill: HBRUSH,
     br_ram_fill: HBRUSH,
+    br_disk_fill: HBRUSH,
     pen_down: HPEN,
     pen_up: HPEN,
     pen_cpu: HPEN,
     pen_ram: HPEN,
+    pen_disk: HPEN,
     pen_border: HPEN,
     pen_grip: HPEN,
     pts: Vec<POINT>,
 }
 
 impl Renderer {
-    pub fn new(dpi: u32, pct: u32) -> Self {
+    pub fn new(dpi: u32, pct: u32, view: View) -> Self {
         let mut r = Renderer {
-            layout: Layout::new(effective_dpi(dpi, pct)),
+            layout: Layout::new(effective_dpi(dpi, pct), view),
             dc: null_mut(),
             bmp: null_mut(),
             old_bmp: null_mut(),
@@ -252,24 +378,32 @@ impl Renderer {
             br_up: null_mut(),
             br_cpu: null_mut(),
             br_ram: null_mut(),
+            br_disk: null_mut(),
+            br_disk_top: null_mut(),
             br_hot: null_mut(),
             br_cpu_fill: null_mut(),
             br_ram_fill: null_mut(),
+            br_disk_fill: null_mut(),
             pen_down: null_mut(),
             pen_up: null_mut(),
             pen_cpu: null_mut(),
             pen_ram: null_mut(),
+            pen_disk: null_mut(),
             pen_border: null_mut(),
             pen_grip: null_mut(),
             pts: Vec::with_capacity(HISTORY_LEN + 2),
         };
-        r.rebuild(dpi, pct);
+        r.rebuild(dpi, pct, view);
         r
     }
 
-    /// Ukuran kartu dalam piksel pada DPI/skala saat ini.
+    /// Ukuran kartu dalam piksel pada DPI/skala/mode saat ini.
     pub fn size(&self) -> (i32, i32) {
         (self.layout.w, self.layout.h)
+    }
+
+    pub fn view(&self) -> View {
+        self.layout.view
     }
 
     pub fn corner_radius(&self) -> i32 {
@@ -282,10 +416,10 @@ impl Renderer {
         x >= self.layout.w - g && y >= self.layout.h - g && x < self.layout.w && y < self.layout.h
     }
 
-    /// Membuat ulang semua objek GDI untuk DPI dan skala baru.
-    pub fn rebuild(&mut self, dpi: u32, pct: u32) {
+    /// Membuat ulang semua objek GDI untuk DPI, skala, dan mode baru.
+    pub fn rebuild(&mut self, dpi: u32, pct: u32, view: View) {
         self.destroy();
-        self.layout = Layout::new(effective_dpi(dpi, pct));
+        self.layout = Layout::new(effective_dpi(dpi, pct), view);
         let s = self.layout.s;
         let font = |h: i32, weight: i32| unsafe {
             let face = wide("Segoe UI");
@@ -318,14 +452,18 @@ impl Renderer {
             self.br_up = CreateSolidBrush(c(UP));
             self.br_cpu = CreateSolidBrush(c(CPU));
             self.br_ram = CreateSolidBrush(c(RAM));
+            self.br_disk = CreateSolidBrush(c(DISK));
+            self.br_disk_top = CreateSolidBrush(mix(DISK, (255, 255, 255), 40));
             self.br_hot = CreateSolidBrush(c(HOT));
             self.br_cpu_fill = CreateSolidBrush(mix(GRAPH_BG, CPU, 28));
             self.br_ram_fill = CreateSolidBrush(mix(GRAPH_BG, RAM, 28));
+            self.br_disk_fill = CreateSolidBrush(mix(GRAPH_BG, DISK, 28));
             let width = s.px(1).max(1);
             self.pen_down = CreatePen(PS_SOLID, width, c(DOWN));
             self.pen_up = CreatePen(PS_SOLID, width, c(UP));
             self.pen_cpu = CreatePen(PS_SOLID, width, c(CPU));
             self.pen_ram = CreatePen(PS_SOLID, width, c(RAM));
+            self.pen_disk = CreatePen(PS_SOLID, width, c(DISK));
             self.pen_border = CreatePen(PS_SOLID, width, BORDER);
             self.pen_grip = CreatePen(PS_SOLID, width, mix((138, 144, 160), BG, 35));
 
@@ -358,13 +496,17 @@ impl Renderer {
                 &mut self.br_up,
                 &mut self.br_cpu,
                 &mut self.br_ram,
+                &mut self.br_disk,
+                &mut self.br_disk_top,
                 &mut self.br_hot,
                 &mut self.br_cpu_fill,
                 &mut self.br_ram_fill,
+                &mut self.br_disk_fill,
                 &mut self.pen_down,
                 &mut self.pen_up,
                 &mut self.pen_cpu,
                 &mut self.pen_ram,
+                &mut self.pen_disk,
                 &mut self.pen_border,
                 &mut self.pen_grip,
             ] {
@@ -377,13 +519,23 @@ impl Renderer {
     }
 
     /// Menggambar kartu ke back-buffer lalu menyalinnya ke `target`.
-    /// `today` = (byte masuk, byte keluar) hari ini.
+    /// `today` = (byte masuk, byte keluar) hari ini. `procs` = proses teratas; hanya
+    /// digambar bila mode memiliki kolom proses (`None` = belum ada data).
     ///
     /// # Safety
     /// `target` harus DC yang valid (mis. dari `BeginPaint`) selama pemanggilan.
-    pub unsafe fn paint(&mut self, target: HDC, s: &Sample, hist: &History, bits: bool, today: (u64, u64)) {
+    pub unsafe fn paint(
+        &mut self,
+        target: HDC,
+        s: &Sample,
+        hist: &History,
+        bits: bool,
+        today: (u64, u64),
+        procs: Option<&ProcTop>,
+    ) {
         let (w, h) = (self.layout.w, self.layout.h);
         let sc = self.layout.s;
+        let view = self.layout.view;
         let full = RECT { left: 0, top: 0, right: w, bottom: h };
         unsafe {
             SelectObject(self.dc, GetStockObject(NULL_PEN));
@@ -396,39 +548,78 @@ impl Renderer {
             SelectObject(self.dc, GetStockObject(NULL_PEN));
         }
 
-        // jaringan: panah, angka (rata kanan), satuan (rata kiri)
+        // --- jaringan: panah, angka (rata kanan), satuan kecil dan redup (rata kiri) ---
         let (dl, ul) = (self.layout.down_line, self.layout.up_line);
-        self.arrow(dl, sc.px(15), sc.px(5), sc.px(4), true, self.br_down);
-        self.arrow(ul, sc.px(15), sc.px(5), sc.px(4), false, self.br_up);
+        self.arrow(dl, sc.px(14), sc.px(4), sc.px(4), true, self.br_down);
+        self.arrow(ul, sc.px(14), sc.px(4), sc.px(4), false, self.br_up);
         let (dv, du) = fmt_rate(s.down, bits);
         let (uv, uu) = fmt_rate(s.up, bits);
-        self.text(self.font_big, TEXT, &dv, span(dl, sc, 26, 84), DT_RIGHT);
-        self.text(self.font_text, DIM, du, span(dl, sc, 88, 122), DT_LEFT);
-        self.text(self.font_big, TEXT, &uv, span(ul, sc, 26, 84), DT_RIGHT);
-        self.text(self.font_text, DIM, uu, span(ul, sc, 88, 122), DT_LEFT);
-        self.net_graph(hist);
+        self.text(self.font_big, TEXT, &dv, span(dl, sc, 21, 64), DT_RIGHT);
+        self.text(self.font_small, DIM, du, span(dl, sc, 67, 112), DT_LEFT);
+        self.text(self.font_big, TEXT, &uv, span(ul, sc, 21, 64), DT_RIGHT);
+        self.text(self.font_small, DIM, uu, span(ul, sc, 67, 112), DT_LEFT);
+        if view.graphs {
+            self.net_graph(hist);
+        }
+        if view.procs
+            && let Some(t) = procs.and_then(|p| p.net.as_ref())
+        {
+            // dua baris: nama di atas, laju di bawah
+            let name = span(dl, sc, X_PROC.0, X_PROC.1);
+            self.text(self.font_small, TEXT, &t.name, name, DT_LEFT | DT_END_ELLIPSIS | DT_BOTTOM);
+            let val = span(ul, sc, X_PROC.0, X_PROC.1);
+            self.text(self.font_small, DIM, &top_value(TopKind::Net, t), val, DT_LEFT | DT_TOP);
+        }
 
-        // CPU & RAM: bar + grafik riwayat 60 detik (skala tetap 0..100 %)
+        // --- CPU, RAM, disk: ikon + bar + angka; grafik dan proses bila mode memintanya ---
         let mem_pct = s.mem_percent();
-        let (cpu_g, ram_g) = (self.layout.cpu_graph, self.layout.ram_graph);
-        self.meter("CPU", s.cpu, self.br_cpu, self.layout.cpu_row);
-        self.load_graph(cpu_g, hist.cpu(), self.br_cpu_fill, self.pen_cpu);
-        self.meter("RAM", mem_pct, self.br_ram, self.layout.ram_row);
-        self.load_graph(ram_g, hist.mem(), self.br_ram_fill, self.pen_ram);
-        let detail = format!("{:.1} / {:.1} GB", gib(s.mem_used), gib(s.mem_total));
-        self.text(self.font_small, DIM, &detail, self.layout.detail, DT_RIGHT);
+        let top = |sel: fn(&ProcTop) -> &Option<Top>| procs.and_then(|p| sel(p).as_ref());
+        let rows = [
+            (Meter { icon: Icon::Cpu, frac: s.cpu / 100.0, hot: s.cpu >= HOT_PERCENT, value: &format!("{:.0}%", s.cpu.clamp(0.0, 100.0)) },
+             self.layout.cpu_row, self.layout.cpu_graph, TopKind::Cpu, top(|p| &p.cpu), 0),
+            (Meter { icon: Icon::Ram, frac: mem_pct / 100.0, hot: mem_pct >= HOT_PERCENT, value: &fmt_compact(s.mem_used) },
+             self.layout.ram_row, self.layout.ram_graph, TopKind::Mem, top(|p| &p.mem), 1),
+            (Meter { icon: Icon::Disk, frac: s.disk_busy / 100.0, hot: s.disk_busy >= HOT_PERCENT, value: &format!("{}/s", fmt_compact(s.disk)) },
+             self.layout.disk_row, self.layout.disk_graph, TopKind::Disk, top(|p| &p.disk), 2),
+        ];
+        for (m, row, graph, kind, tp, which) in rows {
+            self.meter(m, row);
+            if view.graphs {
+                match which {
+                    0 => self.load_graph(graph, hist.cpu(), 100, self.br_cpu_fill, self.pen_cpu),
+                    1 => self.load_graph(graph, hist.mem(), 100, self.br_ram_fill, self.pen_ram),
+                    _ => self.load_graph(graph, hist.disk(), 100, self.br_disk_fill, self.pen_disk),
+                }
+            }
+            if view.procs {
+                self.proc_line(row, tp, kind);
+            }
+        }
 
-        // pemakaian hari ini
+        // --- pemakaian hari ini (susunan menyesuaikan lebar) ---
         let sep = self.layout.usage_sep;
         unsafe {
             FillRect(self.dc, &sep, self.br_track);
         }
         let row = self.layout.usage_row;
-        self.text(self.font_text, DIM, "Hari ini", span(row, sc, 10, 64), DT_LEFT);
-        self.arrow(row, sc.px(73), sc.px(3), sc.px(3), true, self.br_down);
-        self.text(self.font_text, TEXT, &fmt_bytes(today.0), span(row, sc, 80, 148), DT_LEFT);
-        self.arrow(row, sc.px(156), sc.px(3), sc.px(3), false, self.br_up);
-        self.text(self.font_text, TEXT, &fmt_bytes(today.1), span(row, sc, 163, 230), DT_LEFT);
+        if view.procs {
+            self.text(self.font_text, DIM, "Hari ini", span(row, sc, X_PAD, 56), DT_LEFT);
+            self.arrow(row, sc.px(63), sc.px(3), sc.px(3), true, self.br_down);
+            self.text(self.font_text, TEXT, &fmt_bytes(today.0), span(row, sc, 70, 130), DT_LEFT);
+            self.arrow(row, sc.px(139), sc.px(3), sc.px(3), false, self.br_up);
+            self.text(self.font_text, TEXT, &fmt_bytes(today.1), span(row, sc, 146, 228), DT_LEFT);
+        } else if view.graphs {
+            self.text(self.font_small, DIM, "Hari ini", span(row, sc, X_PAD, 46), DT_LEFT);
+            self.arrow(row, sc.px(53), sc.px(3), sc.px(3), true, self.br_down);
+            self.text(self.font_text, TEXT, &fmt_compact(today.0), span(row, sc, 59, 100), DT_LEFT);
+            self.arrow(row, sc.px(107), sc.px(3), sc.px(3), false, self.br_up);
+            self.text(self.font_text, TEXT, &fmt_compact(today.1), span(row, sc, 113, 160), DT_LEFT);
+        } else {
+            self.arrow(row, sc.px(14), sc.px(3), sc.px(3), true, self.br_down);
+            self.text(self.font_text, TEXT, &fmt_compact(today.0), span(row, sc, 20, 56), DT_LEFT);
+            self.arrow(row, sc.px(62), sc.px(3), sc.px(3), false, self.br_up);
+            self.text(self.font_text, TEXT, &fmt_compact(today.1), span(row, sc, 68, 100), DT_LEFT);
+        }
 
         self.grip();
 
@@ -438,21 +629,54 @@ impl Renderer {
         }
     }
 
-    fn text(&self, font: HFONT, color: COLORREF, s: &str, mut r: RECT, align: u32) {
-        let mut buf = [0u16; 40];
+    fn text(&self, font: HFONT, color: COLORREF, s: &str, mut r: RECT, flags: u32) {
+        let mut buf = [0u16; 48];
         let mut n = 0;
         for u in s.encode_utf16().take(buf.len()) {
             buf[n] = u;
             n += 1;
         }
+        // Tanpa flag vertikal eksplisit, teks dipusatkan secara vertikal.
+        let vertical = if flags & (DT_TOP | DT_BOTTOM) != 0 { 0 } else { DT_VCENTER };
         unsafe {
             SelectObject(self.dc, font);
             SetTextColor(self.dc, color);
-            DrawTextW(self.dc, buf.as_ptr(), n as i32, &mut r, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            DrawTextW(self.dc, buf.as_ptr(), n as i32, &mut r, flags | vertical | DT_SINGLELINE | DT_NOPREFIX);
         }
     }
 
-    /// Segitiga kecil sebagai ikon panah turun/naik (tanpa bergantung pada glyph font).
+    /// Lebar teks dalam piksel dengan font `font`.
+    fn text_width(&self, font: HFONT, s: &str) -> i32 {
+        let mut buf = [0u16; 48];
+        let mut n = 0;
+        for u in s.encode_utf16().take(buf.len()) {
+            buf[n] = u;
+            n += 1;
+        }
+        let mut size = SIZE { cx: 0, cy: 0 };
+        unsafe {
+            SelectObject(self.dc, font);
+            GetTextExtentPoint32W(self.dc, buf.as_ptr(), n as i32, &mut size);
+        }
+        size.cx
+    }
+
+    /// Kolom paling kanan satu baris: "nama nilai"; nilai rata kanan, nama dipotong dengan "...".
+    fn proc_line(&self, row: RECT, top: Option<&Top>, kind: TopKind) {
+        let Some(t) = top else { return };
+        let s = self.layout.s;
+        let value = top_value(kind, t);
+        let right = s.px(X_PROC.1);
+        let vw = self.text_width(self.font_small, &value);
+        let val_rect = RECT { left: right - vw - 1, top: row.top, right, bottom: row.bottom };
+        self.text(self.font_small, DIM, &value, val_rect, DT_RIGHT);
+        let name_rect = RECT { left: s.px(X_PROC.0), top: row.top, right: val_rect.left - s.px(3), bottom: row.bottom };
+        if name_rect.right - name_rect.left > s.px(10) {
+            self.text(self.font_small, TEXT, &t.name, name_rect, DT_LEFT | DT_END_ELLIPSIS);
+        }
+    }
+
+    /// Segitiga kecil sebagai ikon turun / naik (tanpa bergantung pada glyph font).
     fn arrow(&self, line: RECT, cx: i32, hw: i32, hh: i32, down: bool, brush: HBRUSH) {
         let cy = (line.top + line.bottom) / 2;
         let pts = if down {
@@ -464,6 +688,63 @@ impl Renderer {
             SelectObject(self.dc, brush);
             Polygon(self.dc, pts.as_ptr(), 3);
             SelectObject(self.dc, GetStockObject(NULL_BRUSH));
+        }
+    }
+
+    /// Ikon kecil (chip, keping memori, silinder disk) digambar dengan primitif GDI,
+    /// berwarna sama dengan bar metriknya.
+    fn icon(&self, icon: Icon, row: RECT) {
+        let s = self.layout.s;
+        let (cx, cy) = (s.px((X_ICON.0 + X_ICON.1) / 2), (row.top + row.bottom) / 2);
+        let dc = self.dc;
+        unsafe {
+            match icon {
+                Icon::Cpu => {
+                    // badan persegi + dua kaki di tiap sisi
+                    let (hb, g, pin) = (s.px(3), s.px(2), s.px(2).max(1));
+                    SelectObject(dc, self.br_cpu);
+                    Rectangle(dc, cx - hb, cy - hb, cx + hb + 1, cy + hb + 1);
+                    SelectObject(dc, self.pen_cpu);
+                    for d in [-g, g] {
+                        MoveToEx(dc, cx + d, cy - hb - pin, null_mut());
+                        LineTo(dc, cx + d, cy - hb);
+                        MoveToEx(dc, cx + d, cy + hb + 1, null_mut());
+                        LineTo(dc, cx + d, cy + hb + 1 + pin);
+                        MoveToEx(dc, cx - hb - pin, cy + d, null_mut());
+                        LineTo(dc, cx - hb, cy + d);
+                        MoveToEx(dc, cx + hb + 1, cy + d, null_mut());
+                        LineTo(dc, cx + hb + 1 + pin, cy + d);
+                    }
+                }
+                Icon::Ram => {
+                    // papan memanjang, tiga chip gelap, deretan kontak di bawah
+                    let (hw, top, bot) = (s.px(6), cy - s.px(3), cy + s.px(2));
+                    SelectObject(dc, self.br_ram);
+                    Rectangle(dc, cx - hw, top, cx + hw, bot);
+                    SelectObject(dc, self.br_graph);
+                    for k in 0..3 {
+                        let x0 = cx - hw + s.px(1) + k * s.px(4);
+                        Rectangle(dc, x0, top + s.px(1), x0 + s.px(3), bot - s.px(1));
+                    }
+                    SelectObject(dc, self.pen_ram);
+                    for k in 0..6 {
+                        let x = cx - hw + s.px(1) + k * s.px(2);
+                        MoveToEx(dc, x, bot, null_mut());
+                        LineTo(dc, x, bot + s.px(2));
+                    }
+                }
+                Icon::Disk => {
+                    // silinder: elips bawah, badan, elips atas (lebih terang)
+                    let hw = s.px(5);
+                    SelectObject(dc, self.br_disk);
+                    Ellipse(dc, cx - hw, cy + s.px(1), cx + hw, cy + s.px(5));
+                    Rectangle(dc, cx - hw, cy - s.px(2), cx + hw, cy + s.px(3));
+                    SelectObject(dc, self.br_disk_top);
+                    Ellipse(dc, cx - hw, cy - s.px(5), cx + hw, cy);
+                }
+            }
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
         }
     }
 
@@ -510,7 +791,7 @@ impl Renderer {
 
     /// Grafik jaringan: unduh = area terisi + garis, unggah = garis; skala otomatis dengan batas bawah.
     fn net_graph(&mut self, hist: &History) {
-        let g = self.layout.graph;
+        let g = self.layout.net_graph;
         let peak = hist.peak().max(GRAPH_FLOOR);
         unsafe {
             FillRect(self.dc, &g, self.br_graph);
@@ -519,34 +800,40 @@ impl Renderer {
         self.plot(g, hist.up(), peak, None, self.pen_up);
     }
 
-    /// Grafik beban CPU/RAM (persen), skala tetap 0..100.
-    fn load_graph(&mut self, g: RECT, vals: impl Iterator<Item = u64>, fill: HBRUSH, pen: HPEN) {
+    /// Grafik riwayat satu metrik dengan skala 0..=`max`.
+    fn load_graph(&mut self, g: RECT, vals: impl Iterator<Item = u64>, max: u64, fill: HBRUSH, pen: HPEN) {
         unsafe {
             FillRect(self.dc, &g, self.br_graph);
         }
-        self.plot(g, vals, 100, Some(fill), pen);
+        self.plot(g, vals, max, Some(fill), pen);
     }
 
-    /// Satu baris: label, bar, angka persen. Grafik riwayatnya digambar di samping (`*_graph`).
-    fn meter(&self, label: &str, pct: f32, brush: HBRUSH, row: RECT) {
+    /// Satu baris: ikon, bar (`m.frac` 0..1), teks nilai. Grafik dan proses digambar terpisah.
+    fn meter(&self, m: Meter, row: RECT) {
+        let Meter { icon, frac, hot, value } = m;
+        let (brush, font) = match icon {
+            Icon::Cpu => (self.br_cpu, self.font_text),
+            Icon::Ram => (self.br_ram, self.font_text),
+            Icon::Disk => (self.br_disk, self.font_small),
+        };
         let s = self.layout.s;
-        self.text(self.font_text, DIM, label, span(row, s, 10, 38), DT_LEFT);
+        self.icon(icon, row);
         let mid = (row.top + row.bottom) / 2;
         let half = s.px(4);
-        let bar = RECT { left: s.px(40), top: mid - half, right: s.px(108), bottom: mid + half };
-        let pct = pct.clamp(0.0, 100.0);
-        let fill_w = ((bar.right - bar.left) as f32 * pct / 100.0) as i32;
+        let bar = RECT { left: s.px(X_BAR.0), top: mid - half, right: s.px(X_BAR.1), bottom: mid + half };
+        let frac = frac.clamp(0.0, 1.0);
+        let fill_w = ((bar.right - bar.left) as f32 * frac) as i32;
         let rad = half * 2;
         unsafe {
             SelectObject(self.dc, self.br_track);
             RoundRect(self.dc, bar.left, bar.top, bar.right + 1, bar.bottom + 1, rad, rad);
             if fill_w > 0 {
-                SelectObject(self.dc, if pct >= HOT_PERCENT { self.br_hot } else { brush });
+                SelectObject(self.dc, if hot { self.br_hot } else { brush });
                 RoundRect(self.dc, bar.left, bar.top, bar.left + fill_w.max(rad) + 1, bar.bottom + 1, rad, rad);
             }
             SelectObject(self.dc, GetStockObject(NULL_BRUSH));
         }
-        self.text(self.font_text, TEXT, &format!("{pct:.0} %"), span(row, s, 110, 148), DT_RIGHT);
+        self.text(font, TEXT, value, span(row, s, X_VALUE.0, X_VALUE.1), DT_RIGHT);
     }
 }
 
@@ -559,6 +846,16 @@ impl Drop for Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MODES: [View; 3] = [
+        View { graphs: true, procs: true },
+        View { graphs: true, procs: false },
+        View { graphs: false, procs: false },
+    ];
+
+    fn smp(down: u64, up: u64, cpu: f32, used: u64, disk_busy: f32) -> Sample {
+        Sample { down, up, cpu, mem_used: used, mem_total: 100, disk_busy, ..Sample::default() }
+    }
 
     #[test]
     fn rate_formatting_bytes() {
@@ -588,25 +885,85 @@ mod tests {
     }
 
     #[test]
+    fn compact_and_cpu_share_formatting() {
+        assert_eq!(fmt_compact(0), "0B");
+        assert_eq!(fmt_compact(1536), "1.5K");
+        assert_eq!(fmt_compact(512 * 1024 * 1024), "512M");
+        assert_eq!(fmt_compact(1_288_490_189), "1.2G");
+        assert_eq!(fmt_compact(10 * 1024 * 1024 * 1024), "10G");
+        assert_eq!(fmt_compact((999.6 * 1024.0) as u64), "1.0M"); // tidak pernah "1000K"
+        assert_eq!(fmt_cpu_share(0), "<1%");
+        assert_eq!(fmt_cpu_share(9), "<1%");
+        assert_eq!(fmt_cpu_share(10), "1%");
+        assert_eq!(fmt_cpu_share(125), "13%");
+        assert_eq!(fmt_cpu_share(1000), "100%");
+    }
+
+    #[test]
+    fn top_values_use_metric_specific_units() {
+        let t = |v| Top { name: "x".into(), value: v };
+        assert_eq!(top_value(TopKind::Cpu, &t(250)), "25%");
+        assert_eq!(top_value(TopKind::Mem, &t(2 << 30)), "2.0G");
+        assert_eq!(top_value(TopKind::Disk, &t(3 << 20)), "3.0M");
+        assert_eq!(top_value(TopKind::Net, &t(24 * 1024)), "24K/s");
+    }
+
+    #[test]
     fn history_is_ordered_oldest_first_and_wraps() {
         let mut h = History::new();
         for i in 1..=(HISTORY_LEN as u64 + 5) {
-            h.push(i, i * 2, i as f32, 150.0);
+            h.push(&smp(i, i * 2, i as f32, 150, 250.0)); // RAM 150 % dan disk 250 % dijepit ke 100
         }
         let d: Vec<u64> = h.down().collect();
         assert_eq!(d.len(), HISTORY_LEN);
         assert_eq!(d[0], 6);
         assert_eq!(*d.last().unwrap(), HISTORY_LEN as u64 + 5);
         assert_eq!(h.peak(), (HISTORY_LEN as u64 + 5) * 2);
+        assert_eq!(h.disk().last(), Some(100));
+        assert_eq!(h.mem().last(), Some(100));
+    }
+
+    #[test]
+    fn view_from_flags_compact_overrides_procs() {
+        assert_eq!(View::from_flags(false, true), View { graphs: true, procs: true });
+        assert_eq!(View::from_flags(false, false), View { graphs: true, procs: false });
+        assert_eq!(View::from_flags(true, true), View { graphs: false, procs: false });
+    }
+
+    #[test]
+    fn card_width_hugs_the_visible_columns() {
+        let (full, no_procs, compact) = (base_size(MODES[0]).0, base_size(MODES[1]).0, base_size(MODES[2]).0);
+        assert!(full > no_procs && no_procs > compact);
+        // tepat kolom terakhir + padding, tanpa ruang kosong
+        assert_eq!(full, X_PROC.1 + X_PAD);
+        assert_eq!(no_procs, X_GRAPH.1 + X_PAD);
+        assert_eq!(compact, X_VALUE.1 + X_PAD);
+        assert!(MODES.iter().all(|m| base_size(*m).1 == BASE_H));
     }
 
     #[test]
     fn size_scales_with_dpi_and_user_percent() {
-        assert_eq!(size_for(96, 100), (BASE_W, BASE_H));
-        assert_eq!(size_for(192, 100), (BASE_W * 2, BASE_H * 2));
-        assert_eq!(size_for(96, 200), (BASE_W * 2, BASE_H * 2));
-        assert_eq!(size_for(144, 50), (BASE_W * 3 / 4, (BASE_H * 3 + 2) / 4));
-        let (w, h) = (Layout::new(96).w, Layout::new(96).h);
-        assert_eq!((w, h), (BASE_W, BASE_H));
+        let v = View::FULL;
+        let (w, h) = base_size(v);
+        assert_eq!(size_for(96, 100, v), (w, h));
+        assert_eq!(size_for(192, 100, v), (w * 2, h * 2));
+        assert_eq!(size_for(96, 200, v), (w * 2, h * 2));
+        assert_eq!(size_for(144, 50, v), (w * 3 / 4, (h * 3 + 2) / 4)); // px() membulatkan ke terdekat
+    }
+
+    #[test]
+    fn layout_rows_stay_inside_card_and_do_not_overlap_in_every_mode() {
+        for view in MODES {
+            let l = Layout::new(96, view);
+            for r in [l.cpu_row, l.ram_row, l.disk_row, l.usage_row, l.down_line, l.up_line] {
+                assert!(r.left >= 0 && r.right <= l.w && r.top >= 0 && r.bottom <= l.h, "{view:?}");
+            }
+            assert!(l.cpu_row.bottom <= l.ram_row.top);
+            assert!(l.ram_row.bottom <= l.disk_row.top);
+            assert!(l.disk_row.bottom <= l.usage_sep.top);
+            assert!(l.usage_sep.bottom <= l.usage_row.top);
+        }
+        // kolom: ikon < bar < nilai < grafik < proses, semuanya di dalam kartu
+        assert!(X_ICON.1 <= X_BAR.0 && X_BAR.1 <= X_VALUE.0 && X_VALUE.1 <= X_GRAPH.0 && X_GRAPH.1 <= X_PROC.0);
     }
 }

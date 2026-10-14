@@ -24,8 +24,12 @@ pub struct Settings {
     pub topmost: bool,
     /// Skala ukuran kartu dalam persen (`SCALE_MIN..=SCALE_MAX`), di atas skala DPI.
     pub scale: u32,
-    /// Selang update dalam milidetik (INTERVAL_MIN..=INTERVAL_MAX).
+    /// Selang update dalam milidetik (`INTERVAL_MIN..=INTERVAL_MAX`).
     pub interval_ms: u32,
+    /// Tampilkan proses teratas tiap metrik (butuh pemindaian proses berkala yang paling mahal).
+    pub procs: bool,
+    /// Mode ringkas: tanpa grafik dan kolom proses (kartu jadi lebih sempit).
+    pub compact: bool,
 }
 
 pub const SCALE_MIN: u32 = 50;
@@ -43,6 +47,8 @@ impl Default for Settings {
             topmost: true,
             scale: 100,
             interval_ms: 1000,
+            procs: true,
+            compact: false,
         }
     }
 }
@@ -78,6 +84,8 @@ impl Settings {
                     }
                 }
                 "topmost" => s.topmost = v != "0",
+                "procs" => s.procs = v != "0",
+                "compact" => s.compact = v == "1",
                 "scale" => {
                     if let Ok(p) = v.parse::<u32>() {
                         s.scale = p.clamp(SCALE_MIN, SCALE_MAX);
@@ -109,6 +117,8 @@ impl Settings {
         out += &format!("topmost={}\n", self.topmost as u8);
         out += &format!("scale={}\n", self.scale);
         out += &format!("interval={}\n", self.interval_ms);
+        out += &format!("procs={}\n", self.procs as u8);
+        out += &format!("compact={}\n", self.compact as u8);
         out
     }
 
@@ -193,6 +203,8 @@ mod tests {
             topmost: false,
             scale: 150,
             interval_ms: 2000,
+            procs: false,
+            compact: true,
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }

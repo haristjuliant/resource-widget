@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::FILETIME;
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
@@ -41,6 +43,10 @@ pub struct Sample {
     /// Byte masuk/keluar sejak sampel sebelumnya (untuk statistik pemakaian).
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Throughput disk fisik (baca + tulis), byte/detik.
+    pub disk: u64,
+    /// Persen waktu aktif disk tersibuk (0..=100), seperti kolom Disk di Task Manager.
+    pub disk_busy: f32,
 }
 
 impl Sample {
@@ -189,6 +195,91 @@ fn read_memory() -> (u64, u64) {
     }
 }
 
+const IOCTL_DISK_PERFORMANCE: u32 = 0x0007_0020;
+const MAX_PHYSICAL_DRIVES: u32 = 16;
+/// Disk dicari ulang tiap sekian sampel (USB/eksternal bisa dicolok/dicabut).
+const DISK_RESCAN_SAMPLES: u32 = 30;
+
+/// Handle ke semua `\\.\PhysicalDriveN` untuk membaca counter byte lewat `IOCTL_DISK_PERFORMANCE`.
+/// Dibuka dengan akses 0 (hanya kueri), jadi tidak butuh hak admin.
+struct DiskCounters {
+    handles: Vec<HANDLE>,
+    /// (IdleTime, QueryTime) pembacaan sebelumnya per handle, untuk persen waktu aktif.
+    prev: Vec<Option<(i64, i64)>>,
+}
+
+impl DiskCounters {
+    fn open() -> Self {
+        let mut handles = Vec::new();
+        for n in 0..MAX_PHYSICAL_DRIVES {
+            let path = crate::wide(&format!("\\\\.\\PhysicalDrive{n}"));
+            // SAFETY: `path` null-terminated; tanpa SECURITY_ATTRIBUTES/template.
+            let h = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if h != INVALID_HANDLE_VALUE {
+                handles.push(h);
+            }
+        }
+        DiskCounters { prev: vec![None; handles.len()], handles }
+    }
+
+    /// (total byte baca + tulis semua disk sejak boot, persen waktu aktif disk tersibuk
+    /// sejak pembacaan lalu); `None` bila tak ada disk yang bisa dibaca. Persen aktif
+    /// = 100 - persen IdleTime, definisi yang sama dengan kolom "Disk" Task Manager.
+    fn read(&mut self) -> Option<(u64, f32)> {
+        let mut total = 0u64;
+        let mut busy_max = 0.0f32;
+        let mut any = false;
+        for (i, &h) in self.handles.iter().enumerate() {
+            let mut buf = [0u8; 96]; // DISK_PERFORMANCE = 88 byte
+            let mut ret = 0u32;
+            // SAFETY: buffer keluaran 96 byte cukup untuk DISK_PERFORMANCE.
+            let ok = unsafe {
+                DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, std::ptr::null(), 0, buf.as_mut_ptr().cast(), 96, &mut ret, std::ptr::null_mut())
+            };
+            if ok != 0 && ret >= 64 {
+                let field = |o: usize| i64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+                total = total.saturating_add(field(0).max(0) as u64).saturating_add(field(8).max(0) as u64);
+                let (idle, query) = (field(32), field(56));
+                if let Some((pi, pq)) = self.prev[i] {
+                    busy_max = busy_max.max(busy_percent(idle - pi, query - pq));
+                }
+                self.prev[i] = Some((idle, query));
+                any = true;
+            }
+        }
+        any.then_some((total, busy_max))
+    }
+}
+
+/// Persen waktu aktif dari selisih IdleTime dan QueryTime (satuan sama, 100 ns).
+fn busy_percent(idle_delta: i64, query_delta: i64) -> f32 {
+    if query_delta <= 0 {
+        return 0.0;
+    }
+    (100.0 * (1.0 - idle_delta as f64 / query_delta as f64)).clamp(0.0, 100.0) as f32
+}
+
+impl Drop for DiskCounters {
+    fn drop(&mut self) {
+        for &h in &self.handles {
+            // SAFETY: handle milik kita dari CreateFileW.
+            unsafe {
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
 pub struct Sampler {
     sel: AdapterSel,
     name_w: Vec<u16>,
@@ -196,6 +287,9 @@ pub struct Sampler {
     rows: Vec<Row>,
     last_net: Option<Instant>,
     cpu_prev: Option<(u64, u64, u64)>,
+    disk: DiskCounters,
+    disk_prev: Option<u64>,
+    samples: u32,
 }
 
 impl Sampler {
@@ -207,6 +301,9 @@ impl Sampler {
             rows: Vec::new(),
             last_net: None,
             cpu_prev: read_cpu_times(),
+            disk: DiskCounters::open(),
+            disk_prev: None,
+            samples: 0,
         };
         s.set_adapter(sel);
         s
@@ -247,13 +344,25 @@ impl Sampler {
         let now = Instant::now();
         self.read_rows();
         let (drx, dtx) = self.net.update(&self.rows);
-        let (down, up) = match self.last_net.replace(now) {
-            Some(t) if now.duration_since(t) <= MAX_GAP => {
-                let dt = now.duration_since(t);
-                (bytes_per_sec(drx, dt), bytes_per_sec(dtx, dt))
-            }
-            _ => (0, 0),
+        // Selang valid sejak sampel lalu (None pada sampel pertama atau setelah sleep/resume).
+        let dt = self.last_net.replace(now).map(|t| now.duration_since(t)).filter(|d| *d <= MAX_GAP);
+        let (down, up) = match dt {
+            Some(dt) => (bytes_per_sec(drx, dt), bytes_per_sec(dtx, dt)),
+            None => (0, 0),
         };
+
+        self.samples = self.samples.wrapping_add(1);
+        if self.samples.is_multiple_of(DISK_RESCAN_SAMPLES) {
+            self.disk = DiskCounters::open();
+            self.disk_prev = None;
+        }
+        let disk_now = self.disk.read();
+        let disk = match (self.disk_prev, disk_now, dt) {
+            (Some(p), Some((c, _)), Some(dt)) => bytes_per_sec(c.saturating_sub(p), dt),
+            _ => 0,
+        };
+        let disk_busy = disk_now.map_or(0.0, |(_, b)| b);
+        self.disk_prev = disk_now.map(|(bytes, _)| bytes);
 
         let cur = read_cpu_times();
         let cpu = match (self.cpu_prev, cur) {
@@ -264,13 +373,22 @@ impl Sampler {
 
         let (mem_used, mem_total) = read_memory();
         // Byte tetap dihitung walau kecepatan dibuang (mis. setelah sleep): trafiknya nyata.
-        Sample { down, up, cpu, mem_used, mem_total, rx_bytes: drx, tx_bytes: dtx }
+        Sample { down, up, cpu, mem_used, mem_total, rx_bytes: drx, tx_bytes: dtx, disk, disk_busy }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_busy_percent_from_idle_time() {
+        assert_eq!(busy_percent(0, 1_000), 100.0); // tidak pernah idle
+        assert_eq!(busy_percent(1_000, 1_000), 0.0); // idle penuh
+        assert!((busy_percent(570, 1_000) - 43.0).abs() < 0.01);
+        assert_eq!(busy_percent(2_000, 1_000), 0.0); // dijepit
+        assert_eq!(busy_percent(5, 0), 0.0); // selang nol/negatif aman
+    }
 
     #[test]
     fn counter_reset_is_zero() {

@@ -14,7 +14,8 @@ use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
 use resource_widget::metrics::{AdapterSel, Sample, Sampler, list_adapters};
-use resource_widget::render::{BASE_H, BASE_W, History, Renderer};
+use resource_widget::procs::ProcMonitor;
+use resource_widget::render::{History, Renderer, View, base_size};
 use resource_widget::settings::{self, SCALE_MAX, SCALE_MIN, Settings};
 use resource_widget::usage::{Usage, today_key};
 use resource_widget::wide;
@@ -31,6 +32,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 const TIMER_ID: usize = 1;
 /// Statistik pemakaian ditulis ke disk sekitar tiap sekian milidetik (dan saat keluar).
 const FLUSH_EVERY_MS: u32 = 60_000;
+/// Proses teratas dipindai sekitar tiap sekian milidetik: pemindaian ≈8 ms, jauh lebih
+/// mahal dari sampel biasa, jadi sengaja jarang.
+const PROC_SCAN_EVERY_MS: u32 = 5_000;
 const OPACITIES: [u8; 5] = [100, 90, 80, 70, 50];
 const SIZE_PRESETS: [u32; 5] = [75, 100, 125, 150, 200];
 /// Pilihan selang update (ms).
@@ -47,6 +51,8 @@ const ID_ADAPTER_BASE: usize = 121; // + indeks adapter
 const ID_TOPMOST: usize = 130;
 const ID_AUTOSTART: usize = 131;
 const ID_STATS: usize = 132;
+const ID_PROCS: usize = 133;
+const ID_COMPACT: usize = 134;
 const ID_EXIT: usize = 199;
 
 /// Semua teks antarmuka di satu tempat agar mudah diganti.
@@ -60,6 +66,8 @@ mod label {
     pub const ADAPTER: &str = "Adaptor jaringan";
     pub const ADAPTER_AUTO: &str = "Otomatis (semua adapter fisik)";
     pub const ADAPTER_INACTIVE: &str = " (tidak aktif)";
+    pub const COMPACT: &str = "Mode ringkas (tanpa grafik)";
+    pub const PROCS: &str = "Proses teratas per metrik";
     pub const STATS: &str = "Statistik pemakaian...";
     pub const TOPMOST: &str = "Selalu di atas";
     pub const AUTOSTART: &str = "Jalankan saat Windows mulai";
@@ -82,6 +90,7 @@ struct State {
     hist: History,
     renderer: Renderer,
     usage: Usage,
+    procs: ProcMonitor,
     ticks: u32,
     resize: Option<ResizeStart>,
 }
@@ -115,10 +124,27 @@ fn flush_every_ticks(interval_ms: u32) -> u32 {
     (FLUSH_EVERY_MS / interval_ms.max(1)).max(1)
 }
 
-/// Skala (persen, kelipatan 5) agar lebar kartu mendekati `width_px` pada `dpi`.
-fn scale_for_width(width_px: i32, dpi: u32) -> u32 {
-    let raw = width_px.max(1) as i64 * 9600 / (BASE_W as i64 * dpi.max(1) as i64);
+/// Jumlah tick antar-pemindaian proses (minimal 1) agar jaraknya sekitar `PROC_SCAN_EVERY_MS`.
+fn scan_every_ticks(interval_ms: u32) -> u32 {
+    PROC_SCAN_EVERY_MS.div_ceil(interval_ms.max(1)).max(1)
+}
+
+/// Mode tampilan menurut pengaturan (ringkas mematikan grafik dan proses).
+fn view_of(s: &Settings) -> View {
+    View::from_flags(s.compact, s.procs)
+}
+
+/// Skala (persen, kelipatan 5) agar lebar kartu `base_w` (logis) mendekati `width_px` pada `dpi`.
+fn scale_for_width(width_px: i32, dpi: u32, base_w: i32) -> u32 {
+    let raw = width_px.max(1) as i64 * 9600 / (base_w.max(1) as i64 * dpi.max(1) as i64);
     (((raw + 2) / 5 * 5) as u32).clamp(SCALE_MIN, SCALE_MAX)
+}
+
+/// Posisi kiri baru saat lebar kartu berubah dari `old_w` ke `new_w`: kartu yang berada di
+/// separuh kanan area kerja menjaga tepi kanannya, selain itu menjaga tepi kirinya.
+fn left_after_resize(left: i32, old_w: i32, new_w: i32, work: RECT) -> i32 {
+    let center = left + old_w / 2;
+    if center > work.left + (work.right - work.left) / 2 { left + old_w - new_w } else { left }
 }
 
 // ------------------------------------------------------------------- Win32
@@ -194,7 +220,8 @@ unsafe fn apply_scale(hwnd: HWND, app: &App, pct: u32) {
                 None
             } else {
                 st.settings.scale = pct;
-                st.renderer.rebuild(dpi, pct);
+                let view = view_of(&st.settings);
+                st.renderer.rebuild(dpi, pct, view);
                 Some(st.renderer.size())
             }
         };
@@ -204,6 +231,31 @@ unsafe fn apply_scale(hwnd: HWND, app: &App, pct: u32) {
             place(hwnd, r.left, r.top, w, h);
             InvalidateRect(hwnd, null(), 0);
         }
+    }
+}
+
+/// Menerapkan perubahan mode (ringkas / proses teratas): kartu mengikuti lebar barunya tanpa
+/// ruang kosong. Posisi disimpan karena tepi kartu bisa bergeser.
+unsafe fn apply_view(hwnd: HWND, app: &App) {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd);
+        let (w, h) = {
+            let mut st = app.state.borrow_mut();
+            let (pct, view) = (st.settings.scale, view_of(&st.settings));
+            st.renderer.rebuild(dpi, pct, view);
+            st.renderer.size()
+        };
+        let mut r: RECT = zeroed();
+        GetWindowRect(hwnd, &mut r);
+        let work = work_area_near(r.left, r.top, r.right - r.left, r.bottom - r.top);
+        place(hwnd, left_after_resize(r.left, r.right - r.left, w, work), r.top, w, h);
+        GetWindowRect(hwnd, &mut r);
+        {
+            let mut st = app.state.borrow_mut();
+            st.settings.pos = Some((r.left, r.top));
+            st.settings.save();
+        }
+        InvalidateRect(hwnd, null(), 0);
     }
 }
 
@@ -228,6 +280,14 @@ unsafe fn end_resize(app: &App) {
 unsafe fn item(menu: HMENU, id: usize, text: &str, checked: bool) {
     unsafe {
         let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
+        AppendMenuW(menu, flags, id, wide(text).as_ptr());
+    }
+}
+
+/// Item menu yang bisa dinonaktifkan (abu-abu) dan tetap menampilkan status centangnya.
+unsafe fn item_state(menu: HMENU, id: usize, text: &str, checked: bool, disabled: bool) {
+    unsafe {
+        let flags = MF_STRING | if checked { MF_CHECKED } else { 0 } | if disabled { MF_GRAYED } else { 0 };
         AppendMenuW(menu, flags, id, wide(text).as_ptr());
     }
 }
@@ -285,6 +345,9 @@ unsafe fn show_menu(hwnd: HWND, app: &'static App, x: i32, y: i32) {
         submenu(menu, label::ADAPTER, m);
 
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        item(menu, ID_COMPACT, label::COMPACT, cur.compact);
+        // Mode ringkas tidak punya kolom proses: pilihannya tetap tersimpan tetapi dinonaktifkan.
+        item_state(menu, ID_PROCS, label::PROCS, cur.procs, cur.compact);
         item(menu, ID_STATS, label::STATS, false);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         item(menu, ID_TOPMOST, label::TOPMOST, cur.topmost);
@@ -325,6 +388,7 @@ unsafe fn on_command(hwnd: HWND, app: &'static App, id: usize, adapters: &[Strin
 
         let mut new_scale = None;
         let mut new_interval = None;
+        let mut view_changed = false;
         let (opacity, topmost) = {
             let mut guard = app.state.borrow_mut();
             let st = &mut *guard;
@@ -346,6 +410,16 @@ unsafe fn on_command(hwnd: HWND, app: &'static App, id: usize, adapters: &[Strin
                 st.sampler.set_adapter(sel);
             } else if id == ID_TOPMOST {
                 st.settings.topmost = !st.settings.topmost;
+            } else if id == ID_PROCS || id == ID_COMPACT {
+                if id == ID_PROCS {
+                    st.settings.procs = !st.settings.procs;
+                } else {
+                    st.settings.compact = !st.settings.compact;
+                }
+                view_changed = true;
+                if view_of(&st.settings).procs {
+                    st.procs.scan(0); // baseline agar pemindaian berikutnya punya pembanding
+                }
             }
             st.settings.save();
             (st.settings.opacity, st.settings.topmost)
@@ -356,6 +430,9 @@ unsafe fn on_command(hwnd: HWND, app: &'static App, id: usize, adapters: &[Strin
         }
         if let Some(ms) = new_interval {
             SetTimer(hwnd, TIMER_ID, ms, None); // SetTimer dengan ID sama mengganti selangnya
+        }
+        if view_changed {
+            apply_view(hwnd, app);
         }
         apply_opacity(hwnd, opacity);
         apply_topmost(hwnd, topmost);
@@ -409,7 +486,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mut guard = app.state.borrow_mut();
                     let st = &mut *guard;
                     let today = st.usage.day(today_key());
-                    st.renderer.paint(hdc, &st.sample, &st.hist, st.settings.bits, today);
+                    let procs = view_of(&st.settings).procs.then(|| st.procs.top());
+                    st.renderer.paint(hdc, &st.sample, &st.hist, st.settings.bits, today, procs);
                 }
                 EndPaint(hwnd, &ps);
                 0
@@ -419,10 +497,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mut guard = app.state.borrow_mut();
                     let st = &mut *guard;
                     let s = st.sampler.sample();
-                    st.hist.push(s.down, s.up, s.cpu, s.mem_percent());
+                    st.hist.push(&s);
                     st.usage.add(today_key(), s.rx_bytes, s.tx_bytes);
                     st.sample = s;
                     st.ticks = st.ticks.wrapping_add(1);
+                    if view_of(&st.settings).procs && st.ticks.is_multiple_of(scan_every_ticks(st.settings.interval_ms)) {
+                        st.procs.scan(s.down + s.up);
+                    }
                     if st.ticks.is_multiple_of(flush_every_ticks(st.settings.interval_ms)) {
                         st.usage.save_if_dirty();
                     }
@@ -441,6 +522,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     (x, y) = (r.left, r.bottom);
                 }
                 show_menu(hwnd, app, x, y);
+                0
+            }
+            // Hanya build debug: memungkinkan uji otomatis tanpa menu (ID sama dengan item menu).
+            // Build rilis tidak menerima perintah dari proses lain.
+            #[cfg(debug_assertions)]
+            WM_COMMAND => {
+                on_command(hwnd, app, wp & 0xFFFF, &[]);
                 0
             }
             WM_NCLBUTTONDBLCLK if wp == HTCAPTION as usize => {
@@ -463,9 +551,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(s) = start {
                     let mut pt: POINT = zeroed();
                     GetCursorPos(&mut pt);
+                    let (base_w, base_h) = base_size(view_of(&app.state.borrow().settings));
                     let by_x = s.w + (pt.x - s.x);
-                    let by_y = (s.h + (pt.y - s.y)) * BASE_W / BASE_H;
-                    apply_scale(hwnd, app, scale_for_width(by_x.max(by_y), GetDpiForWindow(hwnd)));
+                    let by_y = (s.h + (pt.y - s.y)) * base_w / base_h;
+                    apply_scale(hwnd, app, scale_for_width(by_x.max(by_y), GetDpiForWindow(hwnd), base_w));
                 }
                 0
             }
@@ -485,8 +574,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let dpi = (wp & 0xFFFF) as u32;
                 let (w, h) = {
                     let mut st = app.state.borrow_mut();
-                    let pct = st.settings.scale;
-                    st.renderer.rebuild(dpi, pct);
+                    let (pct, view) = (st.settings.scale, view_of(&st.settings));
+                    st.renderer.rebuild(dpi, pct, view);
                     st.renderer.size()
                 };
                 let r = &*(lp as *const RECT);
@@ -540,12 +629,16 @@ fn main() {
 
         let settings = Settings::load();
         let dpi0 = GetDpiForSystem();
-        let renderer = Renderer::new(dpi0, settings.scale);
+        let renderer = Renderer::new(dpi0, settings.scale, view_of(&settings));
         let (w, h) = renderer.size();
         let mut sampler = Sampler::new(settings.adapter.clone());
         let first = sampler.sample(); // baseline; kecepatan baru valid mulai tick berikutnya
         let (x, y) = initial_pos(&settings, w, dpi0);
         let (opacity, topmost, interval_ms) = (settings.opacity, settings.topmost, settings.interval_ms);
+        let mut procs = ProcMonitor::new();
+        if view_of(&settings).procs {
+            procs.scan(0); // baseline; proses teratas baru terisi pada pemindaian berikutnya
+        }
 
         let app: &'static App = Box::leak(Box::new(App {
             state: RefCell::new(State {
@@ -555,6 +648,7 @@ fn main() {
                 hist: History::new(),
                 renderer,
                 usage: Usage::load(),
+                procs,
                 ticks: 0,
                 resize: None,
             }),
@@ -609,8 +703,8 @@ fn main() {
         let (w, h) = {
             let mut st = app.state.borrow_mut();
             if dpi != 0 && dpi != dpi0 {
-                let pct = st.settings.scale;
-                st.renderer.rebuild(dpi, pct);
+                let (pct, view) = (st.settings.scale, view_of(&st.settings));
+                st.renderer.rebuild(dpi, pct, view);
             }
             st.renderer.size()
         };
@@ -649,6 +743,16 @@ mod tests {
     }
 
     #[test]
+    fn process_scan_spacing_follows_interval() {
+        assert_eq!(scan_every_ticks(500), 10);
+        assert_eq!(scan_every_ticks(1000), 5);
+        assert_eq!(scan_every_ticks(2000), 3);
+        assert_eq!(scan_every_ticks(5000), 1);
+        assert_eq!(scan_every_ticks(10_000), 1); // tak pernah 0
+        assert_eq!(scan_every_ticks(0), 5_000);
+    }
+
+    #[test]
     fn interval_labels_and_flush_spacing() {
         assert_eq!(interval_label(500), "0,5 detik");
         assert_eq!(interval_label(1000), "1 detik");
@@ -662,14 +766,29 @@ mod tests {
 
     #[test]
     fn scale_follows_dragged_width() {
-        assert_eq!(scale_for_width(BASE_W, 96), 100);
-        assert_eq!(scale_for_width(BASE_W * 3 / 2, 96), 150);
-        assert_eq!(scale_for_width(BASE_W / 2, 96), 50);
-        assert_eq!(scale_for_width(BASE_W * 2, 192), 100); // DPI 200 %, skala tetap 100
-        assert_eq!(scale_for_width(3, 96), SCALE_MIN);
-        assert_eq!(scale_for_width(100_000, 96), SCALE_MAX);
-        assert_eq!(scale_for_width(-50, 96), SCALE_MIN);
+        let b = base_size(View::FULL).0;
+        assert_eq!(scale_for_width(b, 96, b), 100);
+        assert_eq!(scale_for_width(b * 3 / 2, 96, b), 150);
+        assert_eq!(scale_for_width(b / 2, 96, b), 50);
+        assert_eq!(scale_for_width(b * 2, 192, b), 100); // DPI 200 %, skala tetap 100
+        assert_eq!(scale_for_width(3, 96, b), SCALE_MIN);
+        assert_eq!(scale_for_width(100_000, 96, b), SCALE_MAX);
+        assert_eq!(scale_for_width(-50, 96, b), SCALE_MIN);
         // hasil selalu kelipatan 5
-        assert_eq!(scale_for_width(BASE_W * 113 / 100, 96) % 5, 0);
+        assert_eq!(scale_for_width(b * 113 / 100, 96, b) % 5, 0);
+        // lebar dasar mode ringkas lebih sempit: lebar piksel yang sama berarti skala lebih besar
+        let narrow = base_size(View { graphs: false, procs: false }).0;
+        assert!(scale_for_width(b, 96, narrow) > scale_for_width(b, 96, b));
+    }
+
+    #[test]
+    fn card_keeps_the_edge_nearest_the_screen_side_when_width_changes() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        // kartu di kanan layar: tepi kanan tetap, kiri bergeser
+        assert_eq!(left_after_resize(1660, 248, 184, work), 1724);
+        // kartu di kiri layar: tepi kiri tetap
+        assert_eq!(left_after_resize(100, 248, 184, work), 100);
+        // melebar di kanan layar: kiri mundur agar tepi kanan sama
+        assert_eq!(left_after_resize(1724, 184, 248, work), 1660);
     }
 }

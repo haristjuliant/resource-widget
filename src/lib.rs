@@ -1,6 +1,7 @@
 //! Resource Widget: pustaka metrik, render GDI, pengaturan, dan statistik pemakaian.
 
 pub mod metrics;
+pub mod procs;
 pub mod render;
 pub mod settings;
 pub mod usage;
