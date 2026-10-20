@@ -18,6 +18,8 @@ pub const HISTORY_LEN: usize = 60;
 const GRAPH_FLOOR: u64 = 128 * 1024;
 /// Persentase mulai dari mana bar berwarna merah.
 const HOT_PERCENT: f32 = 90.0;
+/// Suhu (°C) mulai dari mana teks suhu berwarna merah.
+const HOT_TEMP_C: f32 = 85.0;
 
 // ------------------------------------------------------------ logika murni
 
@@ -134,6 +136,11 @@ pub fn fmt_cpu_share(pct10: u64) -> String {
     if pct10 < 10 { "<1%".into() } else { format!("{}%", (pct10 + 5) / 10) }
 }
 
+/// Suhu → "60°" (dibulatkan ke derajat terdekat).
+pub fn fmt_temp(celsius: f32) -> String {
+    format!("{:.0}°", celsius)
+}
+
 /// Teks nilai untuk satu pemenang proses menurut metriknya.
 fn top_value(kind: TopKind, t: &Top) -> String {
     match kind {
@@ -165,6 +172,8 @@ struct Meter<'a> {
     frac: f32,
     hot: bool,
     value: &'a str,
+    /// Suhu perangkat baris ini (°C), digambar di sub-kolom suhu bila mode memilikinya.
+    temp: Option<f32>,
 }
 
 // ------------------------------------------------------------------- warna
@@ -204,14 +213,22 @@ pub struct View {
     pub graphs: bool,
     /// Kolom proses teratas di paling kanan. Hanya bermakna bila `graphs`.
     pub procs: bool,
+    /// Sub-kolom suhu di sebelah angka (CPU: Intel DTT atau zona ACPI, disk: SSD). Bar jadi lebih pendek
+    /// untuk memberi tempat; lebar dan tinggi kartu tidak berubah.
+    pub temps: bool,
 }
 
 impl View {
-    pub const FULL: View = View { graphs: true, procs: true };
+    pub const FULL: View = View { graphs: true, procs: true, temps: true };
 
-    /// Mode dari pengaturan: ringkas mematikan grafik dan proses.
-    pub fn from_flags(compact: bool, procs: bool) -> View {
-        View { graphs: !compact, procs: procs && !compact }
+    /// Mode dari pengaturan: ringkas mematikan grafik dan proses; suhu tidak terpengaruh.
+    pub fn from_flags(compact: bool, procs: bool, temps: bool) -> View {
+        View { graphs: !compact, procs: procs && !compact, temps }
+    }
+
+    /// Tepi kanan bar dan rentang kolom angka (x logis); menyempit bila ada sub-kolom suhu.
+    fn bar_and_value(self) -> (i32, (i32, i32)) {
+        if self.temps { (X_BAR_T, (X_BAR_T + 2, X_TEMP.0 - 2)) } else { (X_BAR.1, X_VALUE) }
     }
 
     /// Tepi kanan kolom terakhir yang tampil (x logis).
@@ -242,6 +259,10 @@ pub fn base_size(view: View) -> (i32, i32) {
 const X_PAD: i32 = 8;
 const X_ICON: (i32, i32) = (8, 20);
 const X_BAR: (i32, i32) = (24, 64);
+/// Tepi kanan bar bila sub-kolom suhu tampil.
+const X_BAR_T: i32 = 46;
+/// Sub-kolom suhu, di ujung kanan kolom angka.
+const X_TEMP: (i32, i32) = (92, 112);
 const X_VALUE: (i32, i32) = (66, 112);
 const X_GRAPH: (i32, i32) = (116, 176);
 const X_PROC: (i32, i32) = (180, 240);
@@ -574,12 +595,14 @@ impl Renderer {
         // --- CPU, RAM, disk: ikon + bar + angka; grafik dan proses bila mode memintanya ---
         let mem_pct = s.mem_percent();
         let top = |sel: fn(&ProcTop) -> &Option<Top>| procs.and_then(|p| sel(p).as_ref());
+        // Suhu di baris perangkatnya: CPU (Intel DTT atau zona ACPI) dan SSD di disk.
+        let temp = |t: Option<f32>| t.filter(|_| view.temps);
         let rows = [
-            (Meter { icon: Icon::Cpu, frac: s.cpu / 100.0, hot: s.cpu >= HOT_PERCENT, value: &format!("{:.0}%", s.cpu.clamp(0.0, 100.0)) },
+            (Meter { icon: Icon::Cpu, frac: s.cpu / 100.0, hot: s.cpu >= HOT_PERCENT, value: &format!("{:.0}%", s.cpu.clamp(0.0, 100.0)), temp: temp(s.cpu_temp) },
              self.layout.cpu_row, self.layout.cpu_graph, TopKind::Cpu, top(|p| &p.cpu), 0),
-            (Meter { icon: Icon::Ram, frac: mem_pct / 100.0, hot: mem_pct >= HOT_PERCENT, value: &fmt_compact(s.mem_used) },
+            (Meter { icon: Icon::Ram, frac: mem_pct / 100.0, hot: mem_pct >= HOT_PERCENT, value: &fmt_compact(s.mem_used), temp: None },
              self.layout.ram_row, self.layout.ram_graph, TopKind::Mem, top(|p| &p.mem), 1),
-            (Meter { icon: Icon::Disk, frac: s.disk_busy / 100.0, hot: s.disk_busy >= HOT_PERCENT, value: &format!("{}/s", fmt_compact(s.disk)) },
+            (Meter { icon: Icon::Disk, frac: s.disk_busy / 100.0, hot: s.disk_busy >= HOT_PERCENT, value: &format!("{}/s", fmt_compact(s.disk)), temp: temp(s.ssd_temp) },
              self.layout.disk_row, self.layout.disk_graph, TopKind::Disk, top(|p| &p.disk), 2),
         ];
         for (m, row, graph, kind, tp, which) in rows {
@@ -810,7 +833,7 @@ impl Renderer {
 
     /// Satu baris: ikon, bar (`m.frac` 0..1), teks nilai. Grafik dan proses digambar terpisah.
     fn meter(&self, m: Meter, row: RECT) {
-        let Meter { icon, frac, hot, value } = m;
+        let Meter { icon, frac, hot, value, temp } = m;
         let (brush, font) = match icon {
             Icon::Cpu => (self.br_cpu, self.font_text),
             Icon::Ram => (self.br_ram, self.font_text),
@@ -820,7 +843,8 @@ impl Renderer {
         self.icon(icon, row);
         let mid = (row.top + row.bottom) / 2;
         let half = s.px(4);
-        let bar = RECT { left: s.px(X_BAR.0), top: mid - half, right: s.px(X_BAR.1), bottom: mid + half };
+        let (bar_right, value_col) = self.layout.view.bar_and_value();
+        let bar = RECT { left: s.px(X_BAR.0), top: mid - half, right: s.px(bar_right), bottom: mid + half };
         let frac = frac.clamp(0.0, 1.0);
         let fill_w = ((bar.right - bar.left) as f32 * frac) as i32;
         let rad = half * 2;
@@ -833,7 +857,11 @@ impl Renderer {
             }
             SelectObject(self.dc, GetStockObject(NULL_BRUSH));
         }
-        self.text(font, TEXT, value, span(row, s, X_VALUE.0, X_VALUE.1), DT_RIGHT);
+        self.text(font, TEXT, value, span(row, s, value_col.0, value_col.1), DT_RIGHT);
+        if let Some(t) = temp {
+            let color = if t >= HOT_TEMP_C { c(HOT) } else { DIM };
+            self.text(self.font_small, color, &fmt_temp(t), span(row, s, X_TEMP.0, X_TEMP.1), DT_RIGHT);
+        }
     }
 }
 
@@ -848,9 +876,9 @@ mod tests {
     use super::*;
 
     const MODES: [View; 3] = [
-        View { graphs: true, procs: true },
-        View { graphs: true, procs: false },
-        View { graphs: false, procs: false },
+        View { graphs: true, procs: true, temps: true },
+        View { graphs: true, procs: false, temps: true },
+        View { graphs: false, procs: false, temps: false },
     ];
 
     fn smp(down: u64, up: u64, cpu: f32, used: u64, disk_busy: f32) -> Sample {
@@ -925,9 +953,25 @@ mod tests {
 
     #[test]
     fn view_from_flags_compact_overrides_procs() {
-        assert_eq!(View::from_flags(false, true), View { graphs: true, procs: true });
-        assert_eq!(View::from_flags(false, false), View { graphs: true, procs: false });
-        assert_eq!(View::from_flags(true, true), View { graphs: false, procs: false });
+        assert_eq!(View::from_flags(false, true, true), View { graphs: true, procs: true, temps: true });
+        assert_eq!(View::from_flags(false, false, false), View { graphs: true, procs: false, temps: false });
+        assert_eq!(View::from_flags(true, true, true), View { graphs: false, procs: false, temps: true });
+    }
+
+    #[test]
+    fn temperature_subcolumn_only_shortens_the_bar() {
+        for m in MODES {
+            let (with, without) = (View { temps: true, ..m }, View { temps: false, ..m });
+            // ukuran kartu sama dengan atau tanpa suhu
+            assert_eq!(base_size(with), base_size(without));
+            let (bar, value) = with.bar_and_value();
+            assert!(X_BAR.0 < bar && bar < value.0 && value.1 < X_TEMP.0 && X_TEMP.1 <= X_VALUE.1);
+            // tetap muat "8.2M/s" (±32 px) dan "58°" (±17 px) pada font kecil
+            assert!(value.1 - value.0 >= 40 && X_TEMP.1 - X_TEMP.0 >= 20);
+            assert_eq!(without.bar_and_value(), (X_BAR.1, X_VALUE));
+        }
+        assert_eq!(fmt_temp(59.6), "60°");
+        assert_eq!(fmt_temp(47.4), "47°");
     }
 
     #[test]

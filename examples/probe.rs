@@ -1,6 +1,6 @@
 //! Cetak metrik tiap detik untuk verifikasi tanpa GUI.
 //! Pemakaian: `cargo run --example probe -- [detik] [nama-adapter]`
-//! Proses teratas dipindai tiap 3 detik (seperti widget).
+//! Proses teratas dipindai tiap 3 detik (seperti widget); suhu dicetak tiap 5 detik.
 
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,11 @@ fn main() {
             v.mem_used as f64 / (1u64 << 30) as f64,
             v.mem_total as f64 / (1u64 << 30) as f64,
         );
+        if i % 5 == 1 {
+            // suhu dibaca ulang sampler tiap 5 detik
+            let c = |t: Option<f32>| t.map_or("-".into(), |c| format!("{c:.1} C"));
+            println!("    suhu  CPU: {}  SSD: {}", c(v.cpu_temp), c(v.ssd_temp));
+        }
         if i % 3 == 0 {
             let t0 = Instant::now();
             let top = procs.scan(v.down + v.up).clone();

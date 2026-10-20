@@ -11,9 +11,14 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::GetSystemTimes;
 
+use crate::temps::Thermal;
+
 /// Jeda antar-sampel lebih dari ini dianggap sleep/resume: kecepatan dibuang (byte tetap dihitung).
 /// Harus lebih besar dari selang update terpanjang (5 dtk).
 const MAX_GAP: Duration = Duration::from_secs(15);
+/// Suhu dibaca ulang paling cepat tiap sekian: suhu berubah lambat, dan tiap kueri SSD
+/// mengirim perintah ke drive.
+const TEMP_POLL_EVERY: Duration = Duration::from_secs(5);
 
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 const IF_OPER_STATUS_UP: i32 = 1;
@@ -47,6 +52,11 @@ pub struct Sample {
     pub disk: u64,
     /// Persen waktu aktif disk tersibuk (0..=100), seperti kolom Disk di Task Manager.
     pub disk_busy: f32,
+    /// Suhu SSD internal terpanas (°C), dibaca ulang tiap `TEMP_POLL_EVERY`. `None` bila tidak
+    /// ada sensor atau suhu dimatikan; begitu juga `cpu_temp`.
+    pub ssd_temp: Option<f32>,
+    /// Suhu CPU (°C): Intel Dynamic Tuning bila berjalan sebagai admin, selain itu zona termal ACPI.
+    pub cpu_temp: Option<f32>,
 }
 
 impl Sample {
@@ -196,7 +206,25 @@ fn read_memory() -> (u64, u64) {
 }
 
 const IOCTL_DISK_PERFORMANCE: u32 = 0x0007_0020;
-const MAX_PHYSICAL_DRIVES: u32 = 16;
+pub(crate) const MAX_PHYSICAL_DRIVES: u32 = 16;
+
+/// Membuka `\\.\PhysicalDriveN` dengan akses 0 (hanya kueri), jadi tidak butuh hak admin.
+pub(crate) fn open_physical_drive(n: u32) -> Option<HANDLE> {
+    let path = crate::wide(&format!("\\\\.\\PhysicalDrive{n}"));
+    // SAFETY: `path` null-terminated; tanpa SECURITY_ATTRIBUTES/template.
+    let h = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    (h != INVALID_HANDLE_VALUE).then_some(h)
+}
 /// Disk dicari ulang tiap sekian sampel (USB/eksternal bisa dicolok/dicabut).
 const DISK_RESCAN_SAMPLES: u32 = 30;
 
@@ -210,25 +238,7 @@ struct DiskCounters {
 
 impl DiskCounters {
     fn open() -> Self {
-        let mut handles = Vec::new();
-        for n in 0..MAX_PHYSICAL_DRIVES {
-            let path = crate::wide(&format!("\\\\.\\PhysicalDrive{n}"));
-            // SAFETY: `path` null-terminated; tanpa SECURITY_ATTRIBUTES/template.
-            let h = unsafe {
-                CreateFileW(
-                    path.as_ptr(),
-                    0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    0,
-                    std::ptr::null_mut(),
-                )
-            };
-            if h != INVALID_HANDLE_VALUE {
-                handles.push(h);
-            }
-        }
+        let handles: Vec<HANDLE> = (0..MAX_PHYSICAL_DRIVES).filter_map(open_physical_drive).collect();
         DiskCounters { prev: vec![None; handles.len()], handles }
     }
 
@@ -290,11 +300,24 @@ pub struct Sampler {
     disk: DiskCounters,
     disk_prev: Option<u64>,
     samples: u32,
+    /// `None` bila tidak ada sensor suhu saat start (sumber dibebaskan).
+    thermal: Option<Thermal>,
+    /// Sensor CPU Intel ada tetapi butuh admin (untuk petunjuk di menu).
+    cpu_temp_needs_admin: bool,
+    temps_on: bool,
+    temp_at: Instant,
 }
 
 impl Sampler {
     pub fn new(sel: AdapterSel) -> Self {
+        let thermal = Thermal::new();
+        let cpu_temp_needs_admin = thermal.cpu_needs_admin();
+        let thermal = Some(thermal).filter(Thermal::any);
         let mut s = Sampler {
+            thermal,
+            cpu_temp_needs_admin,
+            temps_on: true,
+            temp_at: Instant::now(),
             sel: AdapterSel::Auto,
             name_w: Vec::new(),
             net: NetTracker::default(),
@@ -311,6 +334,31 @@ impl Sampler {
 
     pub fn adapter(&self) -> &AdapterSel {
         &self.sel
+    }
+
+    /// `true` bila ada sensor suhu yang memberi nilai saat start.
+    pub fn temps_found(&self) -> bool {
+        self.thermal.is_some()
+    }
+
+    /// `true` bila suhu CPU (Intel) ada tetapi baru terbaca bila widget berjalan sebagai admin.
+    pub fn cpu_temp_needs_admin(&self) -> bool {
+        self.cpu_temp_needs_admin
+    }
+
+    /// Menyalakan/mematikan pembacaan suhu.
+    pub fn set_temps(&mut self, on: bool) {
+        self.temps_on = on;
+    }
+
+    /// (SSD, CPU) °C; sumber dibaca ulang hanya bila `TEMP_POLL_EVERY` sudah lewat.
+    fn sample_temps(&mut self, now: Instant) -> (Option<f32>, Option<f32>) {
+        let Some(th) = self.thermal.as_mut().filter(|_| self.temps_on) else { return (None, None) };
+        if now.duration_since(self.temp_at) >= TEMP_POLL_EVERY {
+            self.temp_at = now;
+            th.poll();
+        }
+        (th.ssd(), th.cpu())
     }
 
     pub fn set_adapter(&mut self, sel: AdapterSel) {
@@ -372,8 +420,9 @@ impl Sampler {
         self.cpu_prev = cur;
 
         let (mem_used, mem_total) = read_memory();
+        let (ssd_temp, cpu_temp) = self.sample_temps(now);
         // Byte tetap dihitung walau kecepatan dibuang (mis. setelah sleep): trafiknya nyata.
-        Sample { down, up, cpu, mem_used, mem_total, rx_bytes: drx, tx_bytes: dtx, disk, disk_busy }
+        Sample { down, up, cpu, mem_used, mem_total, rx_bytes: drx, tx_bytes: dtx, disk, disk_busy, ssd_temp, cpu_temp }
     }
 }
 

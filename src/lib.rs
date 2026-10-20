@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod procs;
 pub mod render;
 pub mod settings;
+pub mod temps;
 pub mod usage;
 
 /// String UTF-16 ber-null-terminator untuk API Win32 `...W`.
