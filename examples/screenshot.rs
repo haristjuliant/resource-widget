@@ -16,8 +16,8 @@ fn main() {
     let out = args.next().expect("pemakaian: screenshot <out.bmp> [skala-persen]");
     let pct: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
     let view = match args.next().as_deref() {
-        Some("noprocs") => View::from_flags(false, false),
-        Some("compact") => View::from_flags(true, true),
+        Some("noprocs") => View::from_flags(false, false, true),
+        Some("compact") => View::from_flags(true, true, true),
         _ => View::FULL,
     };
 
@@ -43,6 +43,8 @@ fn main() {
             mem_total: total,
             disk: (busy as f64 / 100.0 * 150e6) as u64,
             disk_busy: busy,
+            ssd_temp: Some(50.0 + 4.0 * (t * 0.1).sin() + rnd()),
+            cpu_temp: Some(55.0 + 8.0 * rnd()),
             ..Sample::default()
         };
         hist.push(&last);
@@ -54,6 +56,8 @@ fn main() {
     last.mem_used = (total as f64 * 0.61) as u64;
     last.disk = 8_598_323; // 8.2 MB/s
     last.disk_busy = 43.0;
+    last.ssd_temp = Some(58.0);
+    last.cpu_temp = Some(62.0);
     hist.push(&last);
 
     let demo = |value: u64| Some(Top { name: "demo".into(), value });

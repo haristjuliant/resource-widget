@@ -53,6 +53,8 @@ const ID_AUTOSTART: usize = 131;
 const ID_STATS: usize = 132;
 const ID_PROCS: usize = 133;
 const ID_COMPACT: usize = 134;
+const ID_TEMPS: usize = 135;
+const ID_AUTOSTART_ADMIN: usize = 136;
 const ID_EXIT: usize = 199;
 
 /// Semua teks antarmuka di satu tempat agar mudah diganti.
@@ -68,9 +70,13 @@ mod label {
     pub const ADAPTER_INACTIVE: &str = " (tidak aktif)";
     pub const COMPACT: &str = "Mode ringkas (tanpa grafik)";
     pub const PROCS: &str = "Proses teratas per metrik";
+    pub const TEMPS: &str = "Suhu (CPU dan SSD)";
+    pub const TEMPS_NONE: &str = " (tidak ada sensor)";
+    pub const TEMPS_CPU_ADMIN: &str = " (suhu CPU butuh admin)";
     pub const STATS: &str = "Statistik pemakaian...";
     pub const TOPMOST: &str = "Selalu di atas";
     pub const AUTOSTART: &str = "Jalankan saat Windows mulai";
+    pub const AUTOSTART_ADMIN: &str = "Jalankan saat Windows mulai sebagai admin (suhu CPU)";
     pub const EXIT: &str = "Keluar";
 }
 
@@ -143,9 +149,16 @@ unsafe fn app_icon(hinstance: HINSTANCE, small: bool) -> HICON {
     }
 }
 
-/// Mode tampilan menurut pengaturan (ringkas mematikan grafik dan proses).
-fn view_of(s: &Settings) -> View {
-    View::from_flags(s.compact, s.procs)
+/// Mode tampilan menurut pengaturan (ringkas mematikan grafik dan proses). Suhu hanya
+/// ada bila diminta dan ada sensor yang terbaca.
+fn view_of(s: &Settings, temps_found: bool) -> View {
+    View::from_flags(s.compact, s.procs, s.temps && temps_found)
+}
+
+impl State {
+    fn view(&self) -> View {
+        view_of(&self.settings, self.sampler.temps_found())
+    }
 }
 
 /// Skala (persen, kelipatan 5) agar lebar kartu `base_w` (logis) mendekati `width_px` pada `dpi`.
@@ -234,7 +247,7 @@ unsafe fn apply_scale(hwnd: HWND, app: &App, pct: u32) {
                 None
             } else {
                 st.settings.scale = pct;
-                let view = view_of(&st.settings);
+                let view = st.view();
                 st.renderer.rebuild(dpi, pct, view);
                 Some(st.renderer.size())
             }
@@ -255,7 +268,7 @@ unsafe fn apply_view(hwnd: HWND, app: &App) {
         let dpi = GetDpiForWindow(hwnd);
         let (w, h) = {
             let mut st = app.state.borrow_mut();
-            let (pct, view) = (st.settings.scale, view_of(&st.settings));
+            let (pct, view) = (st.settings.scale, st.view());
             st.renderer.rebuild(dpi, pct, view);
             st.renderer.size()
         };
@@ -314,7 +327,11 @@ unsafe fn submenu(menu: HMENU, text: &str, sub: HMENU) {
 
 unsafe fn show_menu(hwnd: HWND, app: &'static App, x: i32, y: i32) {
     unsafe {
-        let cur = app.state.borrow().settings.clone();
+        let (cur, temps_found, cpu_needs_admin) = {
+            let st = app.state.borrow();
+            (st.settings.clone(), st.sampler.temps_found(), st.sampler.cpu_temp_needs_admin())
+        };
+        let admin_autostart = settings::admin_autostart_enabled();
         let active = list_adapters();
         // (nama untuk dicocokkan, label di menu)
         let mut adapters: Vec<(String, String)> =
@@ -362,10 +379,21 @@ unsafe fn show_menu(hwnd: HWND, app: &'static App, x: i32, y: i32) {
         item(menu, ID_COMPACT, label::COMPACT, cur.compact);
         // Mode ringkas tidak punya kolom proses: pilihannya tetap tersimpan tetapi dinonaktifkan.
         item_state(menu, ID_PROCS, label::PROCS, cur.procs, cur.compact);
+        // Tanpa sensor yang terbaca saat start, suhu tidak bisa dinyalakan. Sensor CPU Intel yang
+        // ada tetapi butuh admin diberi petunjuk.
+        let hint = if cpu_needs_admin {
+            label::TEMPS_CPU_ADMIN
+        } else if temps_found {
+            ""
+        } else {
+            label::TEMPS_NONE
+        };
+        item_state(menu, ID_TEMPS, &format!("{}{hint}", label::TEMPS), cur.temps && temps_found, !temps_found);
         item(menu, ID_STATS, label::STATS, false);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         item(menu, ID_TOPMOST, label::TOPMOST, cur.topmost);
         item(menu, ID_AUTOSTART, label::AUTOSTART, settings::autostart_enabled());
+        item(menu, ID_AUTOSTART_ADMIN, label::AUTOSTART_ADMIN, admin_autostart);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         item(menu, ID_EXIT, label::EXIT, false);
 
@@ -390,7 +418,25 @@ unsafe fn on_command(hwnd: HWND, app: &'static App, id: usize, adapters: &[Strin
                 return;
             }
             ID_AUTOSTART => {
-                settings::set_autostart(!settings::autostart_enabled());
+                let on = !settings::autostart_enabled();
+                settings::set_autostart(on);
+                // Hanya satu cara autostart; menghapus tugas admin memunculkan prompt UAC.
+                if on && settings::admin_autostart_enabled() {
+                    settings::set_admin_autostart(false);
+                }
+                return;
+            }
+            ID_AUTOSTART_ADMIN => {
+                if settings::admin_autostart_enabled() {
+                    settings::set_admin_autostart(false);
+                } else if settings::set_admin_autostart(true) {
+                    settings::set_autostart(false);
+                    // Langsung gantikan instance ini dengan instance admin (tanpa prompt kedua):
+                    // instance baru menunggu instance ini keluar.
+                    if !settings::is_elevated() && settings::run_admin_task() {
+                        DestroyWindow(hwnd);
+                    }
+                }
                 return;
             }
             ID_STATS => {
@@ -431,9 +477,13 @@ unsafe fn on_command(hwnd: HWND, app: &'static App, id: usize, adapters: &[Strin
                     st.settings.compact = !st.settings.compact;
                 }
                 view_changed = true;
-                if view_of(&st.settings).procs {
+                if st.view().procs {
                     st.procs.scan(0); // baseline agar pemindaian berikutnya punya pembanding
                 }
+            } else if id == ID_TEMPS {
+                st.settings.temps = !st.settings.temps;
+                st.sampler.set_temps(st.settings.temps);
+                view_changed = true;
             }
             st.settings.save();
             (st.settings.opacity, st.settings.topmost)
@@ -500,7 +550,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mut guard = app.state.borrow_mut();
                     let st = &mut *guard;
                     let today = st.usage.day(today_key());
-                    let procs = view_of(&st.settings).procs.then(|| st.procs.top());
+                    let procs = st.view().procs.then(|| st.procs.top());
                     st.renderer.paint(hdc, &st.sample, &st.hist, st.settings.bits, today, procs);
                 }
                 EndPaint(hwnd, &ps);
@@ -515,7 +565,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     st.usage.add(today_key(), s.rx_bytes, s.tx_bytes);
                     st.sample = s;
                     st.ticks = st.ticks.wrapping_add(1);
-                    if view_of(&st.settings).procs && st.ticks.is_multiple_of(scan_every_ticks(st.settings.interval_ms)) {
+                    if st.view().procs && st.ticks.is_multiple_of(scan_every_ticks(st.settings.interval_ms)) {
                         st.procs.scan(s.down + s.up);
                     }
                     if st.ticks.is_multiple_of(flush_every_ticks(st.settings.interval_ms)) {
@@ -565,7 +615,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(s) = start {
                     let mut pt: POINT = zeroed();
                     GetCursorPos(&mut pt);
-                    let (base_w, base_h) = base_size(view_of(&app.state.borrow().settings));
+                    let (base_w, base_h) = base_size(app.state.borrow().view());
                     let by_x = s.w + (pt.x - s.x);
                     let by_y = (s.h + (pt.y - s.y)) * base_w / base_h;
                     apply_scale(hwnd, app, scale_for_width(by_x.max(by_y), GetDpiForWindow(hwnd), base_w));
@@ -588,7 +638,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let dpi = (wp & 0xFFFF) as u32;
                 let (w, h) = {
                     let mut st = app.state.borrow_mut();
-                    let (pct, view) = (st.settings.scale, view_of(&st.settings));
+                    let (pct, view) = (st.settings.scale, st.view());
                     st.renderer.rebuild(dpi, pct, view);
                     st.renderer.size()
                 };
@@ -634,8 +684,24 @@ unsafe fn reclamp(hwnd: HWND) {
 fn main() {
     unsafe {
         let name = wide("Local\\ResourceWidget");
-        let mutex = CreateMutexW(null(), 0, name.as_ptr());
-        if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
+        // Dijalankan oleh tugas admin (`--handoff`): instance lama mungkin sedang menutup diri
+        // untuk digantikan instance ini, jadi tunggu sebentar (maks. 5 detik) sebelum menyerah.
+        let tries = if std::env::args().any(|a| a == settings::HANDOFF_ARG) { 50 } else { 1 };
+        let mut mutex = null_mut();
+        for i in 0..tries {
+            mutex = CreateMutexW(null(), 0, name.as_ptr());
+            if !mutex.is_null() && GetLastError() != ERROR_ALREADY_EXISTS {
+                break;
+            }
+            if !mutex.is_null() {
+                CloseHandle(mutex);
+                mutex = null_mut();
+            }
+            if i + 1 < tries {
+                Sleep(100);
+            }
+        }
+        if mutex.is_null() {
             return; // sudah berjalan
         }
 
@@ -643,14 +709,15 @@ fn main() {
 
         let settings = Settings::load();
         let dpi0 = GetDpiForSystem();
-        let renderer = Renderer::new(dpi0, settings.scale, view_of(&settings));
-        let (w, h) = renderer.size();
         let mut sampler = Sampler::new(settings.adapter.clone());
+        sampler.set_temps(settings.temps);
         let first = sampler.sample(); // baseline; kecepatan baru valid mulai tick berikutnya
+        let renderer = Renderer::new(dpi0, settings.scale, view_of(&settings, sampler.temps_found()));
+        let (w, h) = renderer.size();
         let (x, y) = initial_pos(&settings, w, dpi0);
         let (opacity, topmost, interval_ms) = (settings.opacity, settings.topmost, settings.interval_ms);
         let mut procs = ProcMonitor::new();
-        if view_of(&settings).procs {
+        if view_of(&settings, sampler.temps_found()).procs {
             procs.scan(0); // baseline; proses teratas baru terisi pada pemindaian berikutnya
         }
 
@@ -717,7 +784,7 @@ fn main() {
         let (w, h) = {
             let mut st = app.state.borrow_mut();
             if dpi != 0 && dpi != dpi0 {
-                let (pct, view) = (st.settings.scale, view_of(&st.settings));
+                let (pct, view) = (st.settings.scale, st.view());
                 st.renderer.rebuild(dpi, pct, view);
             }
             st.renderer.size()
@@ -791,8 +858,19 @@ mod tests {
         // hasil selalu kelipatan 5
         assert_eq!(scale_for_width(b * 113 / 100, 96, b) % 5, 0);
         // lebar dasar mode ringkas lebih sempit: lebar piksel yang sama berarti skala lebih besar
-        let narrow = base_size(View { graphs: false, procs: false }).0;
+        let narrow = base_size(View { graphs: false, procs: false, temps: true }).0;
         assert!(scale_for_width(b, 96, narrow) > scale_for_width(b, 96, b));
+    }
+
+    #[test]
+    fn temperatures_need_both_the_setting_and_a_sensor() {
+        let on = Settings::default();
+        let off = Settings { temps: false, ..Settings::default() };
+        assert!(view_of(&on, true).temps);
+        assert!(!view_of(&on, false).temps);
+        assert!(!view_of(&off, true).temps);
+        // mode ringkas tetap menampilkan suhu
+        assert!(view_of(&Settings { compact: true, ..on }, true).temps);
     }
 
     #[test]
